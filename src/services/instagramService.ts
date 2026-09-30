@@ -232,8 +232,8 @@ async function metaPost(
 async function waitForMediaReady(
   mediaId: string,
   creds: IgCredentials,
-  maxAttempts: number = 30,
-  intervalMs: number = 2000
+  maxAttempts: number = 12,
+  intervalMs: number = 3000
 ): Promise<void> {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const url = `${GRAPH_API_URL}/${mediaId}?fields=status_code,status&access_token=${encodeURIComponent(creds.accessToken)}`;
@@ -341,6 +341,38 @@ export const instagramService = {
   },
 
   /**
+   * Verifica se um creation_id já virou post publicado na Meta.
+   * Consulta o feed da conta (/{igUserId}/media) e casa pelo caption,
+   * que é único por post (contém o display_id no formato "[N] - ...").
+   * Retorna o media_id se publicado, null se não.
+   */
+  async verifyPublished(creationId: string, caption: string, creds: IgCredentials): Promise<string | null> {
+    try {
+      const url = `${GRAPH_API_URL}/${creds.igUserId}/media?fields=id,permalink,media_type,caption&limit=5&access_token=${encodeURIComponent(creds.accessToken)}`;
+      const res = await fetch(url);
+      const data = await res.json();
+
+      if (data.error) {
+        console.warn(`[VERIFY] Erro ao buscar feed: ${data.error.message} (code ${data.error.code})`);
+        return null;
+      }
+
+      const mediaList = data.data || [];
+      const match = mediaList.find((m: any) => m.caption && m.caption.includes(caption));
+
+      if (match && match.id) {
+        console.log(`✅ [VERIFY] Post confirmado no feed: ${match.id} (permalink: ${match.permalink})`);
+        return match.id;
+      }
+
+      return null;
+    } catch (e: any) {
+      console.warn(`[VERIFY] Falha ao checar ${creationId}:`, e.message);
+      return null;
+    }
+  },
+
+  /**
    * Fluxo completo de carrossel com 2 slides:
    * Slide 1 → card do spotted (texto)
    * Slide 2 → imagem base (branding da cidade)
@@ -350,15 +382,13 @@ export const instagramService = {
     baseImageUrl: string,
     caption: string,
     creds: IgCredentials
-  ): Promise<string> {
+  ): Promise<{ mediaId: string; creationId: string }> {
     const cardItemId = await this.createCarouselItem(cardImageUrl, creds);
-    await waitForMediaReady(cardItemId, creds);
 
     console.log("⏱️ Intervalo entre uploads pro Instagram...");
     await new Promise((resolve) => setTimeout(resolve, 1500));
 
     const baseItemId = await this.createCarouselItem(baseImageUrl, creds);
-    await waitForMediaReady(baseItemId, creds);
 
     const carouselId = await this.createCarouselContainer(
       [cardItemId, baseItemId],
@@ -369,7 +399,15 @@ export const instagramService = {
     // O container pai tambem passa por processamento antes de poder ser publicado.
     await waitForMediaReady(carouselId, creds);
 
-    return this.publishMedia(carouselId, creds);
+    let mediaId: string;
+    try {
+      mediaId = await this.publishMedia(carouselId, creds);
+    } catch (e: any) {
+      e.creationId = carouselId;
+      e.childrenIds = [cardItemId, baseItemId];
+      throw e;
+    }
+    return { mediaId, creationId: carouselId };
   },
 
   /**
@@ -381,21 +419,18 @@ export const instagramService = {
     baseImageUrl: string,
     caption: string,
     creds: IgCredentials
-  ): Promise<string> {
+  ): Promise<{ mediaId: string; creationId: string }> {
     const cardItemId = await this.createCarouselItem(cardImageUrl, creds);
-    await waitForMediaReady(cardItemId, creds);
 
     console.log("⏱️ Intervalo entre uploads pro Instagram (1)...");
     await new Promise((resolve) => setTimeout(resolve, 1500));
 
     const userImageItemId = await this.createCarouselItem(userImageUrl, creds);
-    await waitForMediaReady(userImageItemId, creds);
 
     console.log("⏱️ Intervalo entre uploads pro Instagram (2)...");
     await new Promise((resolve) => setTimeout(resolve, 1500));
 
     const baseItemId = await this.createCarouselItem(baseImageUrl, creds);
-    await waitForMediaReady(baseItemId, creds);
 
     const children =
       USER_IMAGE_SLIDE_POSITION === 1
@@ -407,7 +442,15 @@ export const instagramService = {
     // O container pai tambem passa por processamento antes de poder ser publicado.
     await waitForMediaReady(carouselId, creds);
 
-    return this.publishMedia(carouselId, creds);
+    let mediaId: string;
+    try {
+      mediaId = await this.publishMedia(carouselId, creds);
+    } catch (e: any) {
+      e.creationId = carouselId;
+      e.childrenIds = children;
+      throw e;
+    }
+    return { mediaId, creationId: carouselId };
   },
 
   /**

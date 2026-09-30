@@ -136,13 +136,15 @@ router.post("/approve/:id", requireAdmin, async (req: Request, res: Response) =>
   const instagramCaption = `[${postId}] - ${dbRecord.content}\n\n${account.base_caption}`;
 
   let instagramMediaId: string | undefined = undefined;
+  let creationId: string | undefined = undefined;
   let publishError: Error | null = null;
+  let creds: { accessToken: string; igUserId: string } | undefined = undefined;
 
   // 9. Publica no Instagram (se conectado)
   if (account.connection_status === 'ok' && account.access_token_encrypted) {
     try {
       const accessToken = decrypt(account.access_token_encrypted);
-      const creds = { accessToken, igUserId: account.ig_user_id };
+      creds = { accessToken, igUserId: account.ig_user_id };
 
       const quota = await getPublishingLimit(creds);
       if (quota.remaining <= 0) {
@@ -170,19 +172,28 @@ router.post("/approve/:id", requireAdmin, async (req: Request, res: Response) =>
         baseImageUrl: baseImageUrl?.slice(0, 100),
       });
 
+      let publishResult: { mediaId: string; creationId: string };
+
       if (hasUserImage) {
-        instagramMediaId = await instagramService.postCarouselWithUserImage(
+        publishResult = await instagramService.postCarouselWithUserImage(
           cardUrl, dbRecord.image_url!, baseImageUrl, instagramCaption, creds
         );
       } else {
-        instagramMediaId = await instagramService.postCarousel(
+        publishResult = await instagramService.postCarousel(
           cardUrl, baseImageUrl, instagramCaption, creds
         );
       }
 
+      instagramMediaId = publishResult.mediaId;
+      creationId = publishResult.creationId;
+
       console.log(`[APPROVE] Publicado com sucesso! Media ID: ${instagramMediaId}`);
     } catch (igError: any) {
       publishError = igError;
+      // Captura creationId do erro (anexado pelo instagramService quando publishMedia falha)
+      if (!creationId && igError.creationId) {
+        creationId = igError.creationId;
+      }
       console.error("Erro ao postar no Instagram:", {
         message: igError.message,
         metaCode: igError.metaCode,
@@ -202,36 +213,70 @@ router.post("/approve/:id", requireAdmin, async (req: Request, res: Response) =>
     }
   }
 
-  // 10. Atualiza status — SEMPRE roda, mesmo se publishError
+  // 10. Verifica se publicado mesmo com erro (Meta pode publicar e ainda retornar erro)
+  let verifiedMediaId: string | null | undefined = undefined;
+  if (publishError && creationId) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        verifiedMediaId = await instagramService.verifyPublished(creationId, instagramCaption, creds!);
+      } catch (e) {
+        console.warn(`[APPROVE] Falha ao verificar publicação (tentativa ${attempt}/2):`, e);
+      }
+      if (verifiedMediaId) {
+        console.log(`[APPROVE] Publicação confirmada na Meta na tentativa ${attempt}: ${verifiedMediaId}`);
+        break;
+      }
+      if (attempt < 2) {
+        await new Promise((r) => setTimeout(r, 4000));
+      }
+    }
+  }
+
+  // Log de órfãos se a verificação falhou — para você limpar na Meta
+  if (publishError && !verifiedMediaId && creationId) {
+    const err = publishError as any;
+    if (err.childrenIds?.length) {
+      console.error("[APPROVE] Publicação falhou e verificação não encontrou o post. Órfãos na Meta:", {
+        creationId,
+        childrenIds: err.childrenIds,
+      });
+    }
+  }
+
+  // 11. Atualiza status — SEMPRE roda, mesmo se publishError
   // Se publicou: PUBLISHED com media_id
   // Se falhou: mantém PENDING (não mudou), mas logamos o erro
   // Se não conectado: PUBLISHED sem media_id (fluxo manual?)
   try {
-    if (publishError) {
-      // Falhou na publicação: mantém PENDING, mas registra revisão para auditoria
+    const finalMediaId = verifiedMediaId || instagramMediaId;
+    const didPublish = !!finalMediaId;
+
+    if (!didPublish) {
+      // Falhou na publicação e não foi verificado: mantém PENDING
       await supabase.from("spotteds").update({
         reviewed_by: req.admin!.adminId,
         reviewed_at: new Date().toISOString(),
         // status permanece PENDING
       }).eq("id", id);
-      return res.status(500).json({ success: false, message: `Erro Instagram: ${publishError.message}` });
+      return res.status(500).json({ success: false, message: `Erro Instagram: ${publishError!.message}` });
     }
 
-    // Sucesso (ou conta desconectada = fluxo manual): marca PUBLISHED
-    await spottedRepository.updateStatus(id, "PUBLISHED", instagramMediaId);
+    // Sucesso (verificado ou sem erro): marca PUBLISHED
+    await spottedRepository.updateStatus(id, "PUBLISHED", finalMediaId);
 
     await supabase.from("spotteds").update({
       reviewed_by: req.admin!.adminId,
       reviewed_at: new Date().toISOString()
     }).eq("id", id);
 
-    res.json({ success: true, message: "Post aprovado com sucesso.", postId, instagramMediaId, displayId });
+    res.json({ success: true, message: "Post aprovado com sucesso.", postId, instagramMediaId: finalMediaId, displayId });
   } catch (statusErr: any) {
     console.error("[APPROVE] Erro ao atualizar status:", statusErr.message);
     // Se o post foi pro Instagram mas falhou o updateStatus, logamos mas não perdemos o media_id
+    const finalMediaId = verifiedMediaId || instagramMediaId;
     return res.status(500).json({
       success: false,
-      message: `Post publicado no Instagram (Media ID: ${instagramMediaId}) mas falha ao atualizar banco: ${statusErr.message}`
+      message: `Post publicado no Instagram (Media ID: ${finalMediaId}) mas falha ao atualizar banco: ${statusErr.message}`
     });
   }
 });
