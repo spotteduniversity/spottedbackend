@@ -41,7 +41,7 @@ const frontendUrl = process.env.FRONTEND_URL?.replace(/\/+$/, "") || "http://loc
 app.set("trust proxy", 1);
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
-app.use(cors({ origin: [frontendUrl, "http://localhost:3000", "http://localhost:3002", "http://localhost:5173", "https://spottedunicamp.vercel.app", "https://admin-ruddy-two-71.vercel.app"], methods: ["GET", "POST", "PUT", "PATCH", "DELETE"] }));
+app.use(cors({ origin: [frontendUrl, "http://localhost:3000", "http://localhost:3002", "https://spottedadmin.vercel.app", "https://lavrasspotted.vercel.app", "http://localhost:5173", "https://spottedunicamp.vercel.app", "https://admin-ruddy-two-71.vercel.app"], methods: ["GET", "POST", "PUT", "PATCH", "DELETE"] }));
 app.use(express.json({ limit: "10kb" }));
 
 app.use("/posts", express.static(path.join(process.cwd(), "public", "posts")));
