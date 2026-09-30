@@ -15,8 +15,8 @@ import userRoutes from "./routes/userRoutes";
 import storeRoutes from "./routes/storeRoutes";
 import adminRoutes from "./routes/adminRoutes";
 import adminAuthRoutes from "./routes/adminAuthRoutes";
-import adminOAuthRoutes from "./routes/adminOAuthRoutes";
 import adminUsersRoutes from "./routes/adminUsersRoutes";
+import adminAccountsRoutes from "./routes/adminAccountsRoutes";
 import bandecoRoutes from "./routes/bandecoRoutes";
 
 // Vercel Serverless canvas fontconfig workaround
@@ -41,14 +41,14 @@ const frontendUrl = process.env.FRONTEND_URL?.replace(/\/+$/, "") || "http://loc
 app.set("trust proxy", 1);
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
-app.use(cors({ origin: [frontendUrl, "http://localhost:3000", "http://localhost:5173", "https://spottedunicamp.vercel.app", "https://admin-ruddy-two-71.vercel.app"], methods: ["GET", "POST", "PATCH", "DELETE"] }));
+app.use(cors({ origin: [frontendUrl, "http://localhost:3000", "http://localhost:3002", "http://localhost:5173", "https://spottedunicamp.vercel.app", "https://admin-ruddy-two-71.vercel.app"], methods: ["GET", "POST", "PUT", "PATCH", "DELETE"] }));
 app.use(express.json({ limit: "10kb" }));
 
 app.use("/posts", express.static(path.join(process.cwd(), "public", "posts")));
 
 app.use("/api/spotted", rateLimit({
   windowMs: 60 * 60 * 1000,
-  limit: 4,
+  limit: 50,
   message: { success: false, message: "Rate limit exceeded." },
   standardHeaders: "draft-7",
   legacyHeaders: false,
@@ -75,8 +75,8 @@ app.use("/api/store", storeRoutes);
 
 // Admin: gerenciar aprovações
 app.use("/api/admin", adminRoutes);
+app.use("/api/admin/accounts", adminAccountsRoutes);
 app.use("/api/admin/auth", adminAuthRoutes);
-app.use("/api/admin/oauth", adminOAuthRoutes);
 app.use("/api/admin/users", adminUsersRoutes);
 
 // Bandeco: cardápio do RU (rotas abertas para cronjob externo)

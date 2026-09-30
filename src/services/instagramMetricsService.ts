@@ -19,7 +19,6 @@ export interface InstagramInsights {
   reach: number;
   saved: number;
   shares: number;
-  views: number;
 }
 
 export interface InstagramEngagementData {
@@ -50,11 +49,15 @@ async function fetchBasicData(mediaId: string, accessToken: string): Promise<Ins
 }
 
 /**
- * Busca as métricas de insights de um post (reach, saved, shares, views).
- * A partir da v22.0, 'impressions' foi unificado em 'views'.
+ * Busca as métricas de insights de um post (reach, saved, shares).
+ *
+ * Só pedimos o que o farm realmente usa para calcular SC. `views` e
+ * `total_interactions` eram solicitados antes mas nunca gravados em
+ * `spotteds.processed_*`, então saíram do request: a Meta rejeita a chamada
+ * inteira se um dos metrics pedidos não existir para o tipo de mídia.
  */
 async function fetchInsights(mediaId: string, accessToken: string): Promise<InstagramInsights> {
-  const metrics = "views,reach,saved,shares,total_interactions";
+  const metrics = "reach,saved,shares";
   const url = `${GRAPH_API_URL}/${mediaId}/insights?metric=${metrics}&access_token=${accessToken}`;
   const res = await fetch(url);
   const data = await res.json() as any;
@@ -78,7 +81,6 @@ async function fetchInsights(mediaId: string, accessToken: string): Promise<Inst
     reach: metricsMap["reach"] ?? 0,
     saved: metricsMap["saved"] ?? 0,
     shares: metricsMap["shares"] ?? 0,
-    views: metricsMap["views"] ?? 0,
   };
 }
 

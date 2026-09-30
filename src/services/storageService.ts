@@ -82,21 +82,6 @@ export const storageService = {
   },
 
   /**
-   * Retorna a URL fixa da segundaimagem.png (slide 2 do carrossel).
-   * Evita upload repetido a cada envio.
-   */
-  async uploadSecondImage(): Promise<string | null> {
-    if (!supabase) return null;
-    
-    // Retorna a URL pública fixa diretamente, sem fazer upload
-    const { data } = supabase.storage
-      .from("spotted-posts")
-      .getPublicUrl("base/segundaimagem.png");
-      
-    return data.publicUrl;
-  },
-
-  /**
    * Upload da imagem enviada pelo usuário (já comprimida pelo imageCompressionService).
    */
   async uploadUserImage(fileName: string): Promise<string | null> {

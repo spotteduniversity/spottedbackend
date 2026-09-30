@@ -1,6 +1,6 @@
 import { supabase } from "../config/supabase";
 
-export type PostStatus = "PENDING" | "PUBLISHED" | "FAILED" | "BLOCKED" | "REJECTED";
+export type PostStatus = "PENDING" | "PUBLISHED" | "FAILED" | "BLOCKED";
 
 export interface SpottedRecord {
   id?: string;
@@ -10,14 +10,15 @@ export interface SpottedRecord {
   instagram_account_id?: string;
   reviewed_by?: string | null;
   reviewed_at?: string | null;
-  image_url?: string | null;      // URL da imagem enviada pelo usuário (Supabase Storage)
+  image_url?: string | null;
   ip_address: string;
   user_agent?: string | null;
   fingerprint?: string | null;
-  user_id?: string | null;        // opcional — preenchido se usuário estiver logado
-  wants_coin?: boolean;           // opcional — opta pelo programa de SC
+  user_id?: string | null;
+  wants_coin?: boolean;
   claimable_coins?: number;
   claimed_coins?: number;
+  display_id?: number | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -102,18 +103,78 @@ export const spottedRepository = {
   },
 
   /**
-   * Retorna o próximo ID sequencial para exibição (baseado na contagem total de registros).
+   * Reserva e retorna o próximo número de exibição para a conta.
+   * Se o post já tiver display_id (retry), reusa o existente.
+   * Usa RPC atômico para evitar corrida entre aprovações simultâneas.
    */
-  async getNextDisplayId(): Promise<number> {
-    if (!supabase) return Math.floor(10000 + Math.random() * 90000); // fallback aleatório
+  async getOrReserveDisplayId(
+    instagram_account_id: string,
+    existingDisplayId?: number | null
+  ): Promise<number> {
+    if (!supabase) throw new Error("Supabase não configurado.");
+
+    // Se já reservou (retry), reusa
+    if (existingDisplayId && existingDisplayId > 0) {
+      return existingDisplayId;
+    }
+
+    const { data, error } = await supabase.rpc("next_display_id", {
+      p_account: instagram_account_id,
+    });
+
+    if (error) {
+      console.error("Erro ao reservar display_id:", error.message);
+      throw new Error(`Falha ao reservar número do post: ${error.message}`);
+    }
+
+    const displayId = Number(data);
+    if (!Number.isInteger(displayId) || displayId <= 0) {
+      throw new Error("next_display_id retornou valor inválido");
+    }
+    return displayId;
+  },
+
+  /**
+   * Retorna o próximo ID sequencial para exibição baseado APENAS em posts PUBLICADOS da conta.
+   * @deprecated Use getOrReserveDisplayId no fluxo de aprovação.
+   * Mantido apenas para compatibilidade/preview.
+   */
+  async getNextPublishedId(instagram_account_id: string): Promise<number> {
+    if (!supabase) throw new Error("Supabase não configurado.");
 
     const { count, error } = await supabase
       .from("spotteds")
-      .select("*", { count: "exact", head: true });
+      .select("*", { count: "exact", head: true })
+      .eq("instagram_account_id", instagram_account_id)
+      .eq("status", "PUBLISHED");
+
+    if (error) {
+      console.error("Erro ao contar spotteds publicados:", error.message);
+      throw new Error(`Falha ao contar posts publicados: ${error.message}`);
+    }
+
+    return (count || 0) + 1;
+  },
+
+  /**
+   * @deprecated Use getNextPublishedId no fluxo de aprovação.
+   * Este método conta TODOS os posts (incluindo pendentes/rejeitados) e NÃO deve ser usado para o número do Instagram.
+   * Mantido apenas para compatibilidade com preview do submit (número provisório).
+   */
+  async getNextDisplayId(instagram_account_id?: string): Promise<number> {
+    if (!supabase) throw new Error("Supabase não configurado.");
+
+    let query = supabase.from("spotteds").select("*", { count: "exact", head: true });
+
+    if (instagram_account_id) {
+      query = query.eq("instagram_account_id", instagram_account_id);
+    }
+
+    const { count, error } = await query;
 
     if (error) {
       console.error("Erro ao contar spotteds:", error.message);
-      return Math.floor(10000 + Math.random() * 90000);
+      throw new Error(`Falha ao contar posts: ${error.message}`);
     }
 
     return (count || 0) + 1;

@@ -79,10 +79,13 @@ export function requireAccountAccess(req: Request, res: Response, next: NextFunc
     return;
   }
 
+  // `account_id` nas rotas antigas de aprovação; `id` nas rotas de CRUD
+  // de contas (`/accounts/:id`).
   const accountId: string | undefined =
     req.body?.instagram_account_id ||
-    req.query?.account_id as string ||
-    req.params?.account_id;
+    (req.query?.account_id as string) ||
+    req.params?.account_id ||
+    req.params?.id;
 
   if (!accountId) {
     res.status(400).json({ success: false, message: "instagram_account_id é obrigatório." });

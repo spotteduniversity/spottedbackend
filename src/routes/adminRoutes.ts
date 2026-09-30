@@ -8,27 +8,16 @@
 import { Router, Request, Response } from "express";
 import { requireAdmin, requireAccountAccess, requireSuperAdmin } from "../middleware/adminAuth";
 import { spottedRepository } from "../services/spottedRepository";
-import { generateSpottedImage } from "../services/imageService";
+import { generateSpottedImage, generateSpottedImageBuffer, resolveTheme } from "../services/imageService";
 import { storageService } from "../services/storageService";
 import { instagramService } from "../services/instagramService";
-import { cityAssetsService } from "../services/cityAssetsService";
 import { adminRepository } from "../services/adminRepository";
 import { decrypt } from "../services/cryptoService";
 import { supabase } from "../config/supabase";
-import { runTokenRefreshJob } from "../jobs/tokenRefreshJob";
+import { getPublishingLimit } from "../services/instagramService";
+import { fetchTemplateBuffer, TemplateFetchError } from "../services/templateFetchService";
 
 const router = Router();
-
-// POST /api/admin/jobs/refresh-tokens
-// Rota pública para ser chamada por cronjobs externos (ex: cron-job.org)
-router.post("/jobs/refresh-tokens", async (req: Request, res: Response) => {
-  try {
-    const result = await runTokenRefreshJob();
-    res.json({ success: true, result });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
 
 // GET /api/admin/pending
 // Pode receber ?account_id=<uuid> para filtrar. Se não, filtra por req.admin.accountIds
@@ -40,7 +29,7 @@ router.get("/pending", requireAdmin, async (req: Request, res: Response) => {
 
     let query = supabase
       .from("spotteds")
-      .select("*, instagram_accounts(username, display_name)")
+      .select("*, instagram_accounts(username, display_name, is_active)")
       .eq("status", "PENDING")
       .order("created_at", { ascending: false });
 
@@ -59,7 +48,13 @@ router.get("/pending", requireAdmin, async (req: Request, res: Response) => {
     const { data, error } = await query;
     if (error) throw error;
 
-    res.json({ success: true, posts: data });
+    // Contas arquivadas somem da fila: os posts continuam no banco, mas
+    // param de não publicar. Filtro em JS porque o join é um LEFT JOIN.
+    const posts = (data ?? []).filter(
+      (row) => row.instagram_accounts?.is_active !== false
+    );
+
+    res.json({ success: true, posts });
   } catch (error: any) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -67,101 +62,177 @@ router.get("/pending", requireAdmin, async (req: Request, res: Response) => {
 
 // POST /api/admin/approve/:id
 router.post("/approve/:id", requireAdmin, async (req: Request, res: Response) => {
+  const id = req.params.id as string;
+  if (!supabase) throw new Error("Supabase não configurado.");
+
+  // 1. Busca o post pendente
+  const dbRecord = await spottedRepository.findById(id);
+  if (!dbRecord) return res.status(404).json({ success: false, message: "Post não encontrado." });
+  if (dbRecord.status !== "PENDING") return res.status(400).json({ success: false, message: "Post não está pendente." });
+
+  const accountId = dbRecord.instagram_account_id;
+  if (!accountId) return res.status(400).json({ success: false, message: "Spotted sem conta vinculada." });
+
+  // 2. Verifica permissão do admin
+  if (!req.admin!.is_super && !req.admin!.accountIds.includes(accountId)) {
+    return res.status(403).json({ success: false, message: "Sem permissão para esta conta." });
+  }
+
+  // 3. Busca conta com campos necessários (inclui base_caption)
+  const { data: account, error: accountErr } = await supabase
+    .from("instagram_accounts")
+    .select("id, username, ig_user_id, access_token_encrypted, connection_status, needs_reauth, template_image_url, base_image_url, text_color, shadow_color, base_caption")
+    .eq("id", accountId)
+    .single();
+
+  if (accountErr || !account) return res.status(404).json({ success: false, message: "Conta não encontrada." });
+
+  // 4. Valida base_caption obrigatória
+  if (!account.base_caption || account.base_caption.trim() === "") {
+    return res.status(400).json({ success: false, message: "Legenda base (base_caption) não configurada para esta conta." });
+  }
+
+  // 5. Reserva display_id (idempotente: reusa se já reservado)
+  let displayId: number;
   try {
-    const id = req.params.id as string;
-    if (!supabase) throw new Error("Supabase não configurado.");
+    displayId = await spottedRepository.getOrReserveDisplayId(accountId, dbRecord.display_id ?? null);
+  } catch (e: any) {
+    return res.status(500).json({ success: false, message: e.message });
+  }
 
-    const dbRecord = await spottedRepository.findById(id);
-    if (!dbRecord) return res.status(404).json({ success: false, message: "Post não encontrado." });
-    if (dbRecord.status !== "PENDING") return res.status(400).json({ success: false, message: "Post não está pendente." });
-
-    const accountId = dbRecord.instagram_account_id;
-    if (!accountId) return res.status(400).json({ success: false, message: "Spotted sem conta vinculada." });
-
-    // Verifica permissão
-    if (!req.admin!.is_super && !req.admin!.accountIds.includes(accountId)) {
-      return res.status(403).json({ success: false, message: "Sem permissão para esta conta." });
-    }
-
-    // Busca conta para pegar tokens e templates
-    const { data: account } = await supabase
-      .from("instagram_accounts")
-      .select("*")
-      .eq("id", accountId)
-      .single();
-
-    if (!account) return res.status(404).json({ success: false, message: "Conta não encontrada." });
-
-    // Calcula displayId
-    const { count, error: countErr } = await supabase
+  // 6. Se era novo, persiste o display_id no post para retry idempotente
+  if (!dbRecord.display_id) {
+    const { error: dispErr } = await supabase
       .from("spotteds")
-      .select("*", { count: "exact", head: true })
-      .eq("instagram_account_id", accountId)
-      .lte("created_at", dbRecord.created_at);
+      .update({ display_id: displayId })
+      .eq("id", id);
+    if (dispErr) {
+      console.error("[APPROVE] Falha ao gravar display_id:", dispErr.message);
+      return res.status(500).json({ success: false, message: "Falha ao reservar número do post." });
+    }
+  }
 
-    if (countErr) throw countErr;
-    const displayId = count || 1000;
+  // 7. Busca template
+  const templateUrl = account.template_image_url;
+  if (!templateUrl) {
+    return res.status(400).json({ success: false, message: "Template do card não configurado para esta cidade." });
+  }
+  let templateBuffer: Buffer;
+  try {
+    templateBuffer = await fetchTemplateBuffer(templateUrl);
+  } catch (e) {
+    if (e instanceof TemplateFetchError) {
+      console.error("[APPROVE] Template fetch failed:", { code: e.code, status: e.status, message: e.message });
+      return res.status(400).json({ success: false, message: "Template da conta inválido, reenvie a imagem base" });
+    }
+    throw e;
+  }
 
-    // Busca template do card
-    const templateBuffer = await cityAssetsService.getTextCardTemplate(account.text_card_template_path);
-    const hasUserImage = !!dbRecord.image_url;
-    const { fileName, postId } = await generateSpottedImage(dbRecord.content, displayId, hasUserImage, templateBuffer);
+  const theme = resolveTheme(account);
+  const hasUserImage = !!dbRecord.image_url;
+  const { fileName, postId } = await generateSpottedImage(dbRecord.content, displayId, hasUserImage, templateBuffer, theme);
 
-    let instagramMediaId: string | undefined = undefined;
+  // 8. Monta legenda a partir do base_caption do banco
+  const instagramCaption = `[${postId}] - ${dbRecord.content}\n\n${account.base_caption}`;
 
-    // Publica se a conta estiver conectada
-    if (account.connection_status === 'ok' && account.access_token_encrypted) {
-      try {
-        const accessToken = decrypt(account.access_token_encrypted);
-        const creds = { accessToken, igUserId: account.ig_user_id };
+  let instagramMediaId: string | undefined = undefined;
+  let publishError: Error | null = null;
 
-        const [cardUrl, baseImageUrl] = await Promise.all([
-          storageService.uploadCard(fileName),
-          cityAssetsService.getSignedBaseImageUrl(account.base_image_path)
-        ]);
+  // 9. Publica no Instagram (se conectado)
+  if (account.connection_status === 'ok' && account.access_token_encrypted) {
+    try {
+      const accessToken = decrypt(account.access_token_encrypted);
+      const creds = { accessToken, igUserId: account.ig_user_id };
 
-        if (!cardUrl || !baseImageUrl) {
-          throw new Error("Falha ao preparar imagens para o Instagram.");
-        }
+      const quota = await getPublishingLimit(creds);
+      if (quota.remaining <= 0) {
+        return res.status(429).json({
+          success: false,
+          message: `Cota de publicação esgotada (${quota.used}/${quota.limit} nas últimas 24h). Tente mais tarde.`,
+        });
+      }
 
-        const instagramCaption = `[${postId}] - ${dbRecord.content}\n\n#spotted #unicamp\n\n@${account.username}`;
+      const cardUrl = await storageService.uploadCard(fileName);
+      if (!cardUrl) throw new Error("Falha ao enviar card para bucket público.");
 
-        if (hasUserImage) {
-          instagramMediaId = await instagramService.postCarouselWithUserImage(
-            cardUrl, dbRecord.image_url!, baseImageUrl, instagramCaption, creds
-          );
-        } else {
-          instagramMediaId = await instagramService.postCarousel(
-            cardUrl, baseImageUrl, instagramCaption, creds
-          );
-        }
-      } catch (igError: any) {
-        console.error("Erro ao postar no Instagram:", igError);
-        if (igError.isAuthError) {
-          // Marca a conta como precisando de reauth
-          await adminRepository.updateConnection(accountId, {
-            needs_reauth: true,
-            connection_status: 'error',
-            last_error: igError.message
-          });
-        }
-        return res.status(500).json({ success: false, message: `Erro Instagram: ${igError.message}` });
+      const baseImageUrl = account.base_image_url;
+      if (!baseImageUrl) {
+        throw new Error("Foto de encerramento não configurada para esta cidade.");
+      }
+
+      console.log(`[APPROVE] Publicando no Instagram...`, {
+        accountId,
+        igUserId: account.ig_user_id,
+        username: account.username,
+        hasUserImage,
+        displayId,
+        cardUrl: cardUrl?.slice(0, 100),
+        baseImageUrl: baseImageUrl?.slice(0, 100),
+      });
+
+      if (hasUserImage) {
+        instagramMediaId = await instagramService.postCarouselWithUserImage(
+          cardUrl, dbRecord.image_url!, baseImageUrl, instagramCaption, creds
+        );
+      } else {
+        instagramMediaId = await instagramService.postCarousel(
+          cardUrl, baseImageUrl, instagramCaption, creds
+        );
+      }
+
+      console.log(`[APPROVE] Publicado com sucesso! Media ID: ${instagramMediaId}`);
+    } catch (igError: any) {
+      publishError = igError;
+      console.error("Erro ao postar no Instagram:", {
+        message: igError.message,
+        metaCode: igError.metaCode,
+        metaSubcode: igError.metaSubcode,
+        metaUserMsg: igError.metaUserMsg,
+        metaUserTitle: igError.metaUserTitle,
+        httpStatus: igError.httpStatus,
+        stack: igError.stack,
+      });
+      if (igError.isAuthError) {
+        await adminRepository.updateConnection(accountId, {
+          needs_reauth: true,
+          connection_status: 'needs_reauth',
+          last_error: igError.message
+        });
       }
     }
+  }
 
-    // Atualiza status do spotted
+  // 10. Atualiza status — SEMPRE roda, mesmo se publishError
+  // Se publicou: PUBLISHED com media_id
+  // Se falhou: mantém PENDING (não mudou), mas logamos o erro
+  // Se não conectado: PUBLISHED sem media_id (fluxo manual?)
+  try {
+    if (publishError) {
+      // Falhou na publicação: mantém PENDING, mas registra revisão para auditoria
+      await supabase.from("spotteds").update({
+        reviewed_by: req.admin!.adminId,
+        reviewed_at: new Date().toISOString(),
+        // status permanece PENDING
+      }).eq("id", id);
+      return res.status(500).json({ success: false, message: `Erro Instagram: ${publishError.message}` });
+    }
+
+    // Sucesso (ou conta desconectada = fluxo manual): marca PUBLISHED
     await spottedRepository.updateStatus(id, "PUBLISHED", instagramMediaId);
 
-    // Marca quem revisou
     await supabase.from("spotteds").update({
       reviewed_by: req.admin!.adminId,
       reviewed_at: new Date().toISOString()
     }).eq("id", id);
 
-    res.json({ success: true, message: "Post aprovado com sucesso.", postId, instagramMediaId });
-  } catch (error: any) {
-    console.error("Erro ao aprovar post:", error);
-    res.status(500).json({ success: false, message: error.message });
+    res.json({ success: true, message: "Post aprovado com sucesso.", postId, instagramMediaId, displayId });
+  } catch (statusErr: any) {
+    console.error("[APPROVE] Erro ao atualizar status:", statusErr.message);
+    // Se o post foi pro Instagram mas falhou o updateStatus, logamos mas não perdemos o media_id
+    return res.status(500).json({
+      success: false,
+      message: `Post publicado no Instagram (Media ID: ${instagramMediaId}) mas falha ao atualizar banco: ${statusErr.message}`
+    });
   }
 });
 
@@ -169,19 +240,25 @@ router.post("/approve/:id", requireAdmin, async (req: Request, res: Response) =>
 router.post("/reject/:id", requireAdmin, async (req: Request, res: Response) => {
   try {
     const id = req.params.id as string;
-    
-    // Verifica acesso
+
     const dbRecord = await spottedRepository.findById(id);
     if (!dbRecord) return res.status(404).json({ success: false, message: "Post não encontrado." });
-    
+
     const accountId = dbRecord.instagram_account_id;
-    if (accountId && !req.admin!.is_super && !req.admin!.accountIds.includes(accountId)) {
-      return res.status(403).json({ success: false, message: "Sem permissão." });
+
+    // Se o post tem conta, valida permissão normal.
+    // Se NÃO tem conta (NULL), só super admin pode rejeitar.
+    if (accountId) {
+      if (!req.admin!.is_super && !req.admin!.accountIds.includes(accountId)) {
+        return res.status(403).json({ success: false, message: "Sem permissão." });
+      }
+    } else if (!req.admin!.is_super) {
+      return res.status(403).json({ success: false, message: "Post sem conta vinculada: apenas super admin pode rejeitar." });
     }
 
-    // STATUS ATUALIZADO: agora usa REJECTED
-    await spottedRepository.updateStatus(id, "REJECTED");
+    await spottedRepository.updateStatus(id, "BLOCKED");
 
+    if (!supabase) throw new Error("Supabase não configurado.");
     await supabase.from("spotteds").update({
       reviewed_by: req.admin!.adminId,
       reviewed_at: new Date().toISOString()
@@ -206,29 +283,35 @@ router.post("/preview", requireAdmin, async (req: Request, res: Response) => {
       return res.status(403).json({ success: false, message: "Sem permissão." });
     }
 
-    const { data: account } = await supabase.from("instagram_accounts").select("text_card_template_path").eq("id", accountId).single();
-    const templatePath = account ? account.text_card_template_path : null;
-    
-    const templateBuffer = await cityAssetsService.getTextCardTemplate(templatePath);
-    
-    // Para preview, não vamos escrever em disco (fileName), vamos apenas retornar o buffer/base64.
-    // Como generateSpottedImage salva em disco, precisamos de uma versão que retorne buffer.
-    // Mas para não mexer tanto no imageService, podemos deixar salvar temporário e ler?
-    // Melhor ler o arquivo salvo.
-    const displayId = 9999; // ID fake
-    const { fileName } = await generateSpottedImage(content, displayId, false, templateBuffer);
-    
-    const filePath = require("path").join(process.cwd(), "public", "posts", fileName);
-    const fs = require("fs");
-    if (fs.existsSync(filePath)) {
-      const buffer = fs.readFileSync(filePath);
-      const base64 = buffer.toString("base64");
-      // Limpar o arquivo temporário
-      fs.unlinkSync(filePath);
-      return res.json({ success: true, imageBase64: `data:image/jpeg;base64,${base64}` });
-    } else {
-      return res.status(500).json({ success: false, message: "Falha ao gerar preview." });
+    if (!supabase) throw new Error("Supabase não configurado.");
+    const { data: account } = await supabase
+      .from("instagram_accounts")
+      .select("template_image_url, text_color, shadow_color")
+      .eq("id", accountId)
+      .single();
+
+    if (!account || !account.template_image_url) {
+      return res.status(400).json({ success: false, message: "Template do card não configurado para esta cidade." });
     }
+
+    // Baixa template da URL pública
+    let templateBuffer: Buffer;
+    try {
+      templateBuffer = await fetchTemplateBuffer(account.template_image_url!);
+    } catch (e) {
+      if (e instanceof TemplateFetchError) {
+        console.error("[PREVIEW] Template fetch failed:", { code: e.code, status: e.status, message: e.message });
+        return res.status(400).json({ success: false, message: "Template da conta inválido, reenvie a imagem base" });
+      }
+      throw e;
+    }
+
+    const theme = resolveTheme(account);
+
+    // Preview não escreve nada em disco: pede o buffer direto ao imageService.
+    const buffer = await generateSpottedImageBuffer(content, 9999, false, templateBuffer, theme);
+
+    return res.json({ success: true, imageBase64: `data:image/jpeg;base64,${buffer.toString("base64")}` });
   } catch (error: any) {
     res.status(500).json({ success: false, message: error.message });
   }

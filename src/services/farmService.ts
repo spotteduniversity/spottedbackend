@@ -271,7 +271,8 @@ export async function syncUserFarming(userId: string): Promise<FarmSyncResult> {
              const { adminRepository } = require("./adminRepository");
              await adminRepository.updateConnection(post.instagram_account_id, {
                 needs_reauth: true,
-                connection_status: 'error',
+                // A coluna só aceita 'ok' | 'needs_reauth'.
+               connection_status: 'needs_reauth',
                 last_error: err.message
              });
           } catch(e) {}

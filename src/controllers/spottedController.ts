@@ -1,13 +1,13 @@
 import { Request, Response } from "express";
 import multer from "multer";
-import { generateSpottedImage, loadFont } from "../services/imageService";
+import { generateSpottedImage, loadFont, resolveTheme } from "../services/imageService";
 import { spottedRepository, SpottedRecord } from "../services/spottedRepository";
 import { storageService } from "../services/storageService";
 import { imageCompressionService } from "../services/imageCompressionService";
-import { cityAssetsService } from "../services/cityAssetsService";
 import { optionalAuth } from "../middleware/auth";
 import { supabase } from "../config/supabase";
 import path from "path";
+import { fetchTemplateBuffer, TemplateFetchError } from "../services/templateFetchService";
 
 const BANNED_WORDS = [
   "estupro", "estuprar", "estuprador",
@@ -120,7 +120,7 @@ export const sendSpotted = [optionalAuth, async (req: Request, res: Response) =>
     if (!supabase) throw new Error("Supabase não configurado.");
     const { data: account } = await supabase
       .from("instagram_accounts")
-      .select("text_card_template_path")
+      .select("template_image_url, text_color, shadow_color")
       .eq("id", instagram_account_id)
       .single();
 
@@ -128,12 +128,26 @@ export const sendSpotted = [optionalAuth, async (req: Request, res: Response) =>
       return res.status(404).json({ success: false, message: "Conta (cidade) não encontrada." });
     }
 
-    const templateBufferPromise = cityAssetsService.getTextCardTemplate(account.text_card_template_path);
+    if (!account.template_image_url) {
+      return res.status(400).json({ success: false, message: "Template do card não configurado para esta cidade." });
+    }
 
-    const [, displayId, templateBuffer, dbRecord] = await Promise.all([
+    const theme = resolveTheme(account);
+    // Baixa template da URL pública
+    let templateBuffer: Buffer;
+    try {
+      templateBuffer = await fetchTemplateBuffer(account.template_image_url!);
+    } catch (e) {
+      if (e instanceof TemplateFetchError) {
+        console.error("[SEND_SPOTTED] Template fetch failed:", { code: e.code, status: e.status, message: e.message });
+        return res.status(500).json({ success: false, message: "Template da conta inválido, reenvie a imagem base" });
+      }
+      throw e;
+    }
+
+    // Preview gerado SEM número real (número real só é atribuído na aprovação)
+    const [, dbRecord] = await Promise.all([
       loadFont(),
-      spottedRepository.getNextDisplayId(),
-      templateBufferPromise,
       spottedRepository.create({
         content: safeMessage,
         ip_address: ipAddress,
@@ -147,8 +161,8 @@ export const sendSpotted = [optionalAuth, async (req: Request, res: Response) =>
       }),
     ]);
 
-    // O gerador agora desenha "POST COM FOTO" se hasUserImage for true
-    const { fileName, postId } = await generateSpottedImage(safeMessage, displayId, hasUserImage, templateBuffer);
+    // Preview usa placeholder "—" — número real só na aprovação
+    const { fileName, postId } = await generateSpottedImage(safeMessage, 0, hasUserImage, templateBuffer, theme);
 
     res.status(200).json({
       success: true,

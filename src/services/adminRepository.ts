@@ -33,6 +33,9 @@ export interface InstagramAccountSummary {
   last_error: string | null;
   base_image_path: string | null;
   text_card_template_path: string | null;
+  text_color: string;
+  shadow_color: string;
+  base_caption: string | null;
   token_expires_at: string | null;
   token_refreshed_at: string | null;
   created_at: string;
@@ -103,6 +106,126 @@ export const adminRepository = {
   },
 
   /**
+   * Lista todos os admins com as contas vinculadas de cada um.
+   */
+  async listAll(): Promise<Array<SafeAdmin & { account_ids: string[] }>> {
+    if (!supabase) return [];
+
+    const { data, error } = await supabase
+      .from("admins")
+      .select("id, username, is_super, created_at, updated_at")
+      .order("created_at", { ascending: true });
+
+    if (error || !data) return [];
+
+    const { data: links } = await supabase
+      .from("admin_instagram_accounts")
+      .select("admin_id, instagram_account_id");
+
+    const byAdmin = new Map<string, string[]>();
+    for (const link of links ?? []) {
+      const list = byAdmin.get(link.admin_id) ?? [];
+      list.push(link.instagram_account_id);
+      byAdmin.set(link.admin_id, list);
+    }
+
+    return data.map((admin) => ({
+      ...(admin as SafeAdmin),
+      account_ids: byAdmin.get(admin.id) ?? [],
+    }));
+  },
+
+  /**
+   * Atualiza username, flag de super e/ou senha de um admin existente.
+   * Campos ausentes ficam intactos.
+   */
+  async update(
+    id: string,
+    data: { username?: string; password_hash?: string; is_super?: boolean }
+  ): Promise<SafeAdmin> {
+    if (!supabase) throw new Error("Supabase não configurado.");
+
+    const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
+    if (data.username !== undefined) patch.username = data.username.toLowerCase().trim();
+    if (data.password_hash !== undefined) patch.password_hash = data.password_hash;
+    if (data.is_super !== undefined) patch.is_super = data.is_super;
+
+    const { data: record, error } = await supabase
+      .from("admins")
+      .update(patch)
+      .eq("id", id)
+      .select("id, username, is_super, created_at, updated_at")
+      .single();
+
+    if (error) {
+      if (error.code === "23505") throw new Error("DUPLICATE_USERNAME");
+      throw new Error(`Falha ao atualizar admin: ${error.message}`);
+    }
+
+    return record as SafeAdmin;
+  },
+
+  /**
+   * Remove um admin e todas as suas vinculações com contas.
+   */
+  async remove(id: string): Promise<void> {
+    if (!supabase) throw new Error("Supabase não configurado.");
+
+    const { error: linkError } = await supabase
+      .from("admin_instagram_accounts")
+      .delete()
+      .eq("admin_id", id);
+
+    if (linkError) throw new Error(`Falha ao desvincular contas: ${linkError.message}`);
+
+    const { error } = await supabase.from("admins").delete().eq("id", id);
+    if (error) throw new Error(`Falha ao remover admin: ${error.message}`);
+  },
+
+  /**
+   * Substitui o conjunto de contas de um admin pelo array recebido.
+   */
+  async setAccounts(adminId: string, accountIds: string[]): Promise<void> {
+    if (!supabase) throw new Error("Supabase não configurado.");
+
+    const { error: deleteError } = await supabase
+      .from("admin_instagram_accounts")
+      .delete()
+      .eq("admin_id", adminId);
+
+    if (deleteError) {
+      throw new Error(`Falha ao limpar vínculos: ${deleteError.message}`);
+    }
+
+    if (accountIds.length === 0) return;
+
+    const { error } = await supabase.from("admin_instagram_accounts").insert(
+      accountIds.map((instagram_account_id) => ({
+        admin_id: adminId,
+        instagram_account_id,
+      }))
+    );
+
+    if (error) throw new Error(`Falha ao vincular contas: ${error.message}`);
+  },
+
+  /**
+   * Conta quantos super-admins ativos existem. Usado para impedir que o
+   * sistema fique sem nenhum super-admin.
+   */
+  async countSuperAdmins(): Promise<number> {
+    if (!supabase) return 0;
+
+    const { count, error } = await supabase
+      .from("admins")
+      .select("id", { count: "exact", head: true })
+      .eq("is_super", true);
+
+    if (error) return 0;
+    return count ?? 0;
+  },
+
+  /**
    * Retorna os IDs das contas do Instagram que um admin pode gerenciar.
    * is_super → retorna todas as contas.
    */
@@ -141,6 +264,8 @@ export const adminRepository = {
       id, username, ig_user_id, display_name,
       connection_status, needs_reauth, last_error,
       base_image_path, text_card_template_path,
+      text_color, shadow_color,
+      base_caption,
       token_expires_at, token_refreshed_at,
       created_at, updated_at
     `;
@@ -151,7 +276,11 @@ export const adminRepository = {
         .select(SELECT_COLS)
         .order("created_at");
 
-      if (error || !data) return [];
+      if (error) {
+        console.error("[ADMIN_REPO] getAccounts (super) falhou:", error.message);
+        return [];
+      }
+      if (!data) return [];
       return data as InstagramAccountSummary[];
     }
 
@@ -162,7 +291,11 @@ export const adminRepository = {
       .eq("admin_instagram_accounts.admin_id", adminId)
       .order("created_at");
 
-    if (error || !data) return [];
+    if (error) {
+      console.error("[ADMIN_REPO] getAccounts (vinculado) falhou:", error.message);
+      return [];
+    }
+    if (!data) return [];
     return data as InstagramAccountSummary[];
   },
 
@@ -184,7 +317,8 @@ export const adminRepository = {
   },
 
   /**
-   * Atualiza os dados de conexão de uma conta (após OAuth ou renovação).
+   * Atualiza os dados de conexão de uma conta. Usado tanto ao salvar
+   * credenciais quanto ao marcar a conta para reconexão após erro de token.
    */
   async updateConnection(
     accountId: string,
@@ -231,7 +365,7 @@ export const adminRepository = {
       .from("instagram_accounts")
       .upsert(data, { onConflict: "ig_user_id" })
       .select(
-        "id, username, ig_user_id, display_name, connection_status, needs_reauth, last_error, base_image_path, text_card_template_path, token_expires_at, token_refreshed_at, created_at, updated_at"
+        "id, username, ig_user_id, display_name, connection_status, needs_reauth, last_error, base_image_path, text_card_template_path, text_color, shadow_color, base_caption, token_expires_at, token_refreshed_at, created_at, updated_at"
       )
       .single();
 

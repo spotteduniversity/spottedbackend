@@ -150,9 +150,44 @@ const TEXT_SHADOW_COLOR = "rgba(0, 0, 0, 0.65)";
 const TEXT_SHADOW_BLUR = 6;
 const TEXT_SHADOW_OFFSET_X = 2;
 const TEXT_SHADOW_OFFSET_Y = 3;
+const TEXT_COLOR = "#fff";
 
-function applyTextShadow(ctx: any): void {
-  ctx.shadowColor = TEXT_SHADOW_COLOR;
+/**
+ * Cores de Branding por conta. Vem de `instagram_accounts.text_color` /
+ * `shadow_color`; se a conta não definir, cai no default global.
+ */
+export interface SpottedTheme {
+  textColor: string;
+  shadowColor: string;
+}
+
+export const DEFAULT_SPOTTED_THEME: SpottedTheme = {
+  textColor: TEXT_COLOR,
+  shadowColor: TEXT_SHADOW_COLOR,
+};
+
+/**
+ * Normaliza o que vier do banco. Aceita hex (#rgb, #rrggbb) e rgba()/rgb().
+ * Qualquer coisa fora disso cai no default, para nunca quebrar a geração.
+ */
+export function resolveTheme(input: {
+  text_color?: string | null;
+  shadow_color?: string | null;
+} | null | undefined): SpottedTheme {
+  const valid = (value: string | null | undefined, pattern: RegExp, fallback: string) => {
+    if (typeof value !== "string") return fallback;
+    const trimmed = value.trim();
+    return pattern.test(trimmed) ? trimmed : fallback;
+  };
+
+  return {
+    textColor: valid(input?.text_color, /^#([0-9a-f]{3}|[0-9a-f]{6})$/i, DEFAULT_SPOTTED_THEME.textColor),
+    shadowColor: valid(input?.shadow_color, /^rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*(,\s*(0|1|0?\.\d+)\s*)?\)$/i, DEFAULT_SPOTTED_THEME.shadowColor),
+  };
+}
+
+function applyTextShadow(ctx: any, shadowColor: string = TEXT_SHADOW_COLOR): void {
+  ctx.shadowColor = shadowColor;
   ctx.shadowBlur = TEXT_SHADOW_BLUR;
   ctx.shadowOffsetX = TEXT_SHADOW_OFFSET_X;
   ctx.shadowOffsetY = TEXT_SHADOW_OFFSET_Y;
@@ -170,12 +205,13 @@ async function drawLineWithEmoji(
   line: string,
   centerX: number,
   y: number,
-  emojiSize: number
+  emojiSize: number,
+  shadowColor: string
 ): Promise<void> {
   const segments = splitIntoSegments(line);
 
   if (segments.every(s => s.type === 'text')) {
-    applyTextShadow(ctx);
+    applyTextShadow(ctx, shadowColor);
     ctx.fillText(line, centerX, y);
     clearShadow(ctx);
     return;
@@ -189,7 +225,7 @@ async function drawLineWithEmoji(
 
   for (const seg of segments) {
     if (seg.type === 'text') {
-      applyTextShadow(ctx);
+      applyTextShadow(ctx, shadowColor);
       ctx.fillText(seg.value, x, y);
       clearShadow(ctx);
       x += ctx.measureText(seg.value).width;
@@ -211,42 +247,53 @@ const HEIGHT = 1350;
 const PADDING = 96;
 const MAX_WIDTH = WIDTH - (PADDING * 2);
 
-export const generateSpottedImage = async (message: string, displayId: number, hasUserImage: boolean = false, templateBuffer?: Buffer | null): Promise<{ fileName: string; postId: string }> => {
-  await loadFont();
-  emojiImageCache.clear();
+interface DrawCardArgs {
+  ctx: any;
+  canvas: any;
+  message: string;
+  postId: string;
+  hasUserImage: boolean;
+  templateBuffer?: Buffer | null;
+  textColor: string;
+  shadowColor: string;
+}
 
-  const postId = displayId.toString();
-  const canvas = createCanvas(WIDTH, HEIGHT);
-  const ctx = canvas.getContext("2d");
-
-  try {
-    if (templateBuffer) {
-      const baseImage = await loadImage(templateBuffer);
+/**
+ * Desenha o card no canvas. Compartilhado entre a versão que grava em disco
+ * (fluxo de aprovação) e a que devolve buffer (preview do painel).
+ */
+async function drawCard({
+  ctx,
+  canvas,
+  message,
+  postId,
+  hasUserImage,
+  templateBuffer,
+  textColor,
+  shadowColor,
+}: DrawCardArgs): Promise<void> {
+  if (templateBuffer) {
+    const baseImage = await loadImage(templateBuffer);
+    ctx.drawImage(baseImage, 0, 0, WIDTH, HEIGHT);
+  } else {
+    const basePath = path.join(process.cwd(), "public", "fim.jpg");
+    if (fs.existsSync(basePath)) {
+      const baseImage = await loadImage(basePath);
       ctx.drawImage(baseImage, 0, 0, WIDTH, HEIGHT);
     } else {
-      const basePath = path.join(process.cwd(), "public", "fim.jpg");
-      if (fs.existsSync(basePath)) {
-        const baseImage = await loadImage(basePath);
-        ctx.drawImage(baseImage, 0, 0, WIDTH, HEIGHT);
-      } else {
-        ctx.fillStyle = "#fff";
-        ctx.fillRect(0, 0, WIDTH, HEIGHT);
-      }
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, WIDTH, HEIGHT);
     }
-  } catch (error) {
-    console.error("Erro ao carregar imagem base:", error);
-    ctx.fillStyle = "#fff";
-    ctx.fillRect(0, 0, WIDTH, HEIGHT);
   }
 
-  ctx.fillStyle = "#fff";
+  ctx.fillStyle = textColor;
   ctx.font = '400 32px "Bungee", sans-serif';
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
 
   // Só mostra o ID se a mensagem tiver 270 caracteres ou menos
   if (message.length <= 280) {
-    applyTextShadow(ctx);
+    applyTextShadow(ctx, shadowColor);
     ctx.fillText(`[${postId}]`, WIDTH / 2, HEIGHT * 0.350);
     clearShadow(ctx);
   }
@@ -320,18 +367,40 @@ export const generateSpottedImage = async (message: string, displayId: number, h
   const startY = centerY - (totalTextHeight / 2) + (lineHeight / 2);
 
   for (let index = 0; index < lines.length; index++) {
-    await drawLineWithEmoji(ctx, lines[index], WIDTH / 2, startY + (index * lineHeight), emojiSize);
+    await drawLineWithEmoji(ctx, lines[index], WIDTH / 2, startY + (index * lineHeight), emojiSize, shadowColor);
   }
 
   if (hasUserImage) {
+    // Label sobre a foto do usuário: fundo escuro fixo, texto na cor da conta
     ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+    ctx.fillRect(0, HEIGHT * 0.88 - 26, WIDTH, 52);
+    ctx.fillStyle = textColor;
     ctx.font = '400 28px "Bungee", sans-serif';
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    applyTextShadow(ctx);
+    applyTextShadow(ctx, shadowColor);
     ctx.fillText("POST COM FOTO  📷  →", WIDTH / 2, HEIGHT * 0.88);
     clearShadow(ctx);
   }
+}
+
+export const generateSpottedImage = async (
+  message: string,
+  displayId: number,
+  hasUserImage: boolean = false,
+  templateBuffer?: Buffer | null,
+  theme?: SpottedTheme | null
+): Promise<{ fileName: string; postId: string }> => {
+  await loadFont();
+  emojiImageCache.clear();
+
+  const { textColor, shadowColor } = theme ?? DEFAULT_SPOTTED_THEME;
+  // Preview (displayId === 0) usa "—" como placeholder; número real só na aprovação
+  const postId = displayId > 0 ? displayId.toString() : "—";
+  const canvas = createCanvas(WIDTH, HEIGHT);
+  const ctx = canvas.getContext("2d");
+
+  await drawCard({ ctx, canvas, message, postId, hasUserImage, templateBuffer, textColor, shadowColor });
 
   const fileName = `spotted_${postId}.jpg`;
   const postsDir = path.join(os.tmpdir(), "posts");
@@ -341,15 +410,33 @@ export const generateSpottedImage = async (message: string, displayId: number, h
   }
 
   const outPath = path.join(postsDir, fileName);
-  return new Promise(async (resolve, reject) => {
-    try {
-      const buffer = await canvas.encode('jpeg', 95);
-      fs.writeFile(outPath, buffer, (err) => {
-        if (err) return reject(err);
-        resolve({ fileName, postId });
-      });
-    } catch (e) {
-      reject(e);
-    }
-  });
+  const buffer = await canvas.encode("jpeg", 95);
+
+  await fs.promises.writeFile(outPath, buffer);
+  return { fileName, postId };
+};
+
+/**
+ * Versão que devolve o JPEG em memória, sem tocar em disco.
+ * Usada pelo preview do painel admin, que só quer mostrar o resultado.
+ */
+export const generateSpottedImageBuffer = async (
+  message: string,
+  displayId: number,
+  hasUserImage: boolean = false,
+  templateBuffer?: Buffer | null,
+  theme?: SpottedTheme | null
+): Promise<Buffer> => {
+  await loadFont();
+  emojiImageCache.clear();
+
+  const { textColor, shadowColor } = theme ?? DEFAULT_SPOTTED_THEME;
+  // Preview (displayId === 0) usa "—" como placeholder
+  const postId = displayId > 0 ? displayId.toString() : "—";
+  const canvas = createCanvas(WIDTH, HEIGHT);
+  const ctx = canvas.getContext("2d");
+
+  await drawCard({ ctx, canvas, message, postId, hasUserImage, templateBuffer, textColor, shadowColor });
+
+  return canvas.encode("jpeg", 92);
 };

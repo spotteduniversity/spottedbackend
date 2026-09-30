@@ -1,7 +1,9 @@
 import { scrapeAlmoco, scrapeJantar, MenuItem } from "./bandecoScraper";
 import { generateBandecoImage } from "./bandecoImageGenerator";
 import { storageService } from "./storageService";
-import { instagramService } from "./instagramService";
+import { instagramService, IgCredentials } from "./instagramService";
+import { supabase } from "../config/supabase";
+import { decrypt } from "./cryptoService";
 
 interface BandecoData {
   type: "ALMOÇO" | "JANTAR";
@@ -9,6 +11,30 @@ interface BandecoData {
   dayOfWeek: string;
   padrao: MenuItem;
   vegano: MenuItem;
+}
+
+/**
+ * Resolve as credenciais da conta que recebe os stories do bandeco.
+ * Usa BANDECO_ACCOUNT_ID se definido; senão, a primeira conta conectada.
+ * Retorna null quando não há conta conectada.
+ */
+async function resolveCredentials(): Promise<IgCredentials | null> {
+  if (!supabase) return null;
+
+  let query = supabase
+    .from("instagram_accounts")
+    .select("id, ig_user_id, access_token_encrypted")
+    .eq("connection_status", "ok")
+    .not("access_token_encrypted", "is", null);
+
+  if (process.env.BANDECO_ACCOUNT_ID) {
+    query = query.eq("id", process.env.BANDECO_ACCOUNT_ID);
+  }
+
+  const { data, error } = await query.limit(1).maybeSingle();
+  if (error || !data) return null;
+
+  return { accessToken: decrypt(data.access_token_encrypted), igUserId: data.ig_user_id };
 }
 
 async function processBandeco(type: "ALMOÇO" | "JANTAR", scrapedData: BandecoData): Promise<{ success: boolean; imageUrl?: string; instagramMediaId?: string; error?: string }> {
@@ -31,13 +57,14 @@ async function processBandeco(type: "ALMOÇO" | "JANTAR", scrapedData: BandecoDa
     console.log(`✅ Imagem disponível em: ${publicImageUrl}`);
 
     // Passo 3: Publicar no Instagram Stories
-    if (!instagramService.isConfigured()) {
-      console.warn("⚠️ Instagram não configurado. Pulando publicação.");
+    const creds = await resolveCredentials();
+    if (!creds) {
+      console.warn("⚠️ Nenhuma conta do Instagram conectada. Pulando publicação.");
       return { success: true, imageUrl: publicImageUrl };
     }
 
     console.log("📱 Publicando Story no Instagram...");
-    const mediaId = await instagramService.postStory(publicImageUrl);
+    const mediaId = await instagramService.postStory(publicImageUrl, creds);
 
     return { success: true, imageUrl: publicImageUrl, instagramMediaId: mediaId };
   } catch (error: any) {
