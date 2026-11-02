@@ -23,6 +23,7 @@ export const storageService = {
 
     const fileBuffer = fs.readFileSync(filePath);
     const contentType = filePath.endsWith(".png") ? "image/png" : "image/jpeg";
+    console.log(`[STORAGE][DEBUG] UPLOAD_FILE | storagePath=${storagePath} | contentType=${contentType} | bytes=${fileBuffer.length}`);
 
     const { error: uploadError } = await supabase.storage
       .from("spotted-posts")
@@ -32,7 +33,7 @@ export const storageService = {
       });
 
     if (uploadError) {
-      console.error("Erro no upload para Supabase Storage:", uploadError.message);
+      console.error("[STORAGE][DEBUG] UPLOAD_FILE_ERROR | storagePath=${storagePath} | error=${uploadError.message}", uploadError.message);
       throw new Error(`Falha no upload: ${uploadError.message}`);
     }
 
@@ -40,6 +41,7 @@ export const storageService = {
       .from("spotted-posts")
       .getPublicUrl(storagePath);
 
+    console.log(`[STORAGE][DEBUG] UPLOAD_FILE_PUBLIC_URL | storagePath=${storagePath} | url=${data.publicUrl}`);
     console.log(`✅ Upload concluído: ${data.publicUrl}`);
     return data.publicUrl;
   },
@@ -76,9 +78,14 @@ export const storageService = {
   /**
    * Upload do card gerado (spotted com texto).
    */
-  async uploadCard(fileName: string): Promise<string | null> {
+  async uploadCard(fileName: string, slug?: string | null): Promise<string | null> {
     const filePath = path.join(require("os").tmpdir(), "posts", fileName);
-    return this.uploadFile(filePath, `cards/${fileName}`);
+    const folder = slug && slug.trim() ? slug.trim() : "cards";
+    const storagePath = `${folder}/${fileName}`;
+    console.log(`[STORAGE][DEBUG] UPLOAD_CARD | slug=${slug} | folder=${folder} | storagePath=${storagePath} | filePath=${filePath} | bucket=spotted-posts`);
+    const result = await this.uploadFile(filePath, storagePath);
+    console.log(`[STORAGE][DEBUG] UPLOAD_CARD_RESULT | storagePath=${storagePath} | url=${result}`);
+    return result;
   },
 
   /**

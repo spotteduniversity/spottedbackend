@@ -17,6 +17,7 @@ import adminRoutes from "./routes/adminRoutes";
 import adminAuthRoutes from "./routes/adminAuthRoutes";
 import adminUsersRoutes from "./routes/adminUsersRoutes";
 import adminAccountsRoutes from "./routes/adminAccountsRoutes";
+import accountRoutes from "./routes/accountRoutes";
 import bandecoRoutes from "./routes/bandecoRoutes";
 
 // Vercel Serverless canvas fontconfig workaround
@@ -41,7 +42,7 @@ const frontendUrl = process.env.FRONTEND_URL?.replace(/\/+$/, "") || "http://loc
 app.set("trust proxy", 1);
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
-app.use(cors({ origin: [frontendUrl, "http://localhost:3000", "https://spottedadmin.vercel.app", "https://lavrasspotted.vercel.app", "http://localhost:3002", "http://localhost:5173", "https://spottedunicamp.vercel.app", "https://admin-ruddy-two-71.vercel.app"], methods: ["GET", "POST", "PUT", "PATCH", "DELETE"] }));
+app.use(cors({ origin: [frontendUrl, "http://localhost:3000", "http://localhost:3002", "http://localhost:5173", "https://spottedunicamp.vercel.app", "https://admin-ruddy-two-71.vercel.app"], methods: ["GET", "POST", "PUT", "PATCH", "DELETE"] }));
 app.use(express.json({ limit: "10kb" }));
 
 app.use("/posts", express.static(path.join(process.cwd(), "public", "posts")));
@@ -53,6 +54,8 @@ app.use("/api/spotted", rateLimit({
   standardHeaders: "draft-7",
   legacyHeaders: false,
 }), spottedRoutes);
+
+app.use("/api/account", accountRoutes);
 
 // Farm Engine: sincroniza engajamento e credita SC
 // Rate limit: 2 req / 2h por IP (espelha o cooldown de 120min do motor)

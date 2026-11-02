@@ -1,8 +1,9 @@
 import { Router } from "express";
-import { sendSpotted, spottedUpload } from "../controllers/spottedController";
+import { sendSpotted } from "../controllers/spottedController";
+import { assetUpload } from "../services/cityAssetsService";
 
 const router = Router();
 
-router.post("/send", spottedUpload.single("image"), sendSpotted);
+router.post("/send", assetUpload.single("image"), sendSpotted);
 
 export default router;

@@ -20,23 +20,34 @@ import { verifyInstagramCredentials } from "../services/instagramService";
 
 const router = Router();
 
-const SELECT_ACCOUNT =
-  "id, username, ig_user_id, display_name, slug, is_active, connection_status, " +
-  "needs_reauth, last_error, base_image_path, text_card_template_path, " +
-  "text_color, shadow_color, token_expires_at, token_refreshed_at, created_at, updated_at";
-
-// Mesma lista, porém com o token. Só é usada dentro do servidor e sempre
-// atravessa publicAccount(), que devolve apenas se existe um token.
-const SELECT_ACCOUNT_SECRET =
-  "id, username, ig_user_id, display_name, slug, is_active, connection_status, " +
-  "needs_reauth, last_error, base_image_path, text_card_template_path, " +
-  "text_color, shadow_color, token_expires_at, token_refreshed_at, " +
-  "access_token_encrypted, created_at, updated_at";
+// `*` mantém as rotas funcionando mesmo antes de uma migração de coluna
+// (ex.: is_moderated). O token continua sendo removido por publicAccount().
+const SELECT_ACCOUNT_SECRET = "*";
 
 /** Tira o segredo e expõe somente a existência de um token configurado. */
 function publicAccount(row: Record<string, any>) {
   const { access_token_encrypted, ...rest } = row;
   return { ...rest, has_token: Boolean(access_token_encrypted) };
+}
+
+/**
+ * Sobe o logo e grava a URL em spotted_logo. Usado pela rota /logo e tambem
+ * por /assets quando um cliente antigo envia kind=logo (compatibilidade).
+ */
+async function saveAccountLogo(file: { buffer: Buffer }, id: string) {
+  const publicUrl = await cityAssetsService.uploadLogo(file.buffer, id);
+
+  if (!supabase) throw new Error("Supabase nao configurado.");
+
+  const { data, error } = await supabase
+    .from("instagram_accounts")
+    .update({ spotted_logo: publicUrl, updated_at: new Date().toISOString() })
+    .eq("id", id)
+    .select(SELECT_ACCOUNT_SECRET)
+    .single();
+
+  if (error) throw new Error(error.message);
+  return publicAccount(data);
 }
 
 /** Resolve o accountId das rotas (`:id` ou `:account_id`) e devolve null se ausente. */
@@ -87,9 +98,12 @@ router.post("/", requireAdmin, async (req: Request, res: Response) => {
   try {
     if (!supabase) throw new Error("Supabase não configurado.");
 
-    const { display_name, username } = req.body;
+    const { display_name, username, is_moderated } = req.body;
     if (!display_name?.trim()) {
       return fail(res, 400, "Informe o nome da cidade.");
+    }
+    if (is_moderated !== undefined && typeof is_moderated !== "boolean") {
+      return fail(res, 400, "is_moderated deve ser booleano.");
     }
 
     const now = new Date().toISOString();
@@ -109,6 +123,7 @@ router.post("/", requireAdmin, async (req: Request, res: Response) => {
         is_active: true,
         text_color: "#ffffff",
         shadow_color: "rgba(0, 0, 0, 0.65)",
+        ...(typeof is_moderated === "boolean" ? { is_moderated } : {}),
         created_at: now,
         updated_at: now,
       })
@@ -129,7 +144,14 @@ router.patch("/:id", requireAdmin, requireAccountAccess, async (req: Request, re
     if (!supabase) throw new Error("Supabase não configurado.");
     const id = accountId(req)!;
 
-    const allowed = ["display_name", "username", "slug", "text_color", "shadow_color"] as const;
+    const allowed = [
+      "display_name",
+      "username",
+      "slug",
+      "text_color",
+      "shadow_color",
+      "is_moderated",
+    ] as const;
     const patch: Record<string, unknown> = {};
     for (const field of allowed) {
       if (req.body[field] !== undefined) patch[field] = req.body[field];
@@ -137,6 +159,9 @@ router.patch("/:id", requireAdmin, requireAccountAccess, async (req: Request, re
 
     if (patch.display_name !== undefined && !String(patch.display_name).trim()) {
       return fail(res, 400, "O nome da cidade não pode ficar vazio.");
+    }
+    if (patch.is_moderated !== undefined && typeof patch.is_moderated !== "boolean") {
+      return fail(res, 400, "is_moderated deve ser booleano.");
     }
     if (patch.username !== undefined) {
       // Regras de usuário do Instagram: até 30 chars, sem @, espaço ou hífen.
@@ -244,13 +269,20 @@ router.post(
       const file = req.file;
       if (!file) return fail(res, 400, "Envie um arquivo de imagem.");
 
-      const kind = req.body.kind as "base" | "template";
-      if (kind !== "base" && kind !== "template") {
-        return fail(res, 400, "Informe kind=base ou kind=template.");
+      const kind = req.body.kind as "base" | "template" | "logo";
+      if (kind !== "base" && kind !== "template" && kind !== "logo") {
+        return fail(res, 400, "Informe kind=base, kind=template ou kind=logo.");
       }
 
       if (file.mimetype !== "image/png" && file.mimetype !== "image/jpeg") {
         return fail(res, 415, "Formato aceito: PNG ou JPEG.");
+      }
+
+      // Compatibilidade: clientes antigos mandam o logo para /assets com
+      // kind=logo. A rota /logo continua sendo o caminho novo.
+      if (kind === "logo") {
+        const account = await saveAccountLogo(file, id);
+        return res.json({ success: true, message: "Logo enviado.", account });
       }
 
       const contentType = file.mimetype;
@@ -274,6 +306,34 @@ router.post(
       if (error) throw new Error(error.message);
 
       res.json({ success: true, message: "Arquivo enviado.", account: publicAccount(data) });
+    } catch (error: any) {
+      fail(res, 500, error.message);
+    }
+  }
+);
+
+// POST /api/admin/accounts/:id/logo
+// Upload de logo da conta (.png/.jpg). Sobe pro bucket público spotted-assets
+// e salva a URL na coluna spotted_logo do banco.
+router.post(
+  "/:id/logo",
+  requireAdmin,
+  requireAccountAccess,
+  assetUpload.single("file"),
+  async (req: Request, res: Response) => {
+    try {
+      const id = accountId(req)!;
+      const file = req.file;
+      if (!file) return fail(res, 400, "Envie um arquivo de imagem.");
+
+      if (file.mimetype !== "image/png" && file.mimetype !== "image/jpeg") {
+        return fail(res, 415, "Formato aceito: PNG ou JPEG.");
+      }
+
+      // Logo tem processamento próprio: mantém proporção/transparência e
+      // grava em logo.png (não sobrescreve a foto de encerramento).
+      const account = await saveAccountLogo(file, id);
+      res.json({ success: true, message: "Logo enviado.", account });
     } catch (error: any) {
       fail(res, 500, error.message);
     }

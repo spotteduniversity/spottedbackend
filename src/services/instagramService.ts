@@ -14,7 +14,7 @@
  * Docs: https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/content-publishing#carousel-posts
  */
 
-const GRAPH_API_URL = "https://graph.facebook.com/v22.0";
+const GRAPH_API_URL = "https://graph.facebook.com/v23.0";
 
 /**
  * Posição da imagem do usuário no carrossel.
@@ -158,8 +158,12 @@ async function metaPost(
   encoding: "json" | "form" = "json"
 ): Promise<any> {
   const logPrefix = context ? `[${context}] ` : "";
-  console.log(`${logPrefix}→ ${url} (${encoding})`);
-  console.log(`${logPrefix}  body:`, JSON.stringify(redactSecrets(body), null, 2).slice(0, 500));
+  const tStart = Date.now();
+  console.log(`[META][${context || "UNKNOWN"}] REQUEST_START | url=${url} | encoding=${encoding} | at=${new Date().toISOString()}`);
+  console.log(`[META][${context || "UNKNOWN"}] REQUEST_BODY | ${JSON.stringify(redactSecrets(body))}`);
+  if (context === "createCarouselContainer") {
+    console.log(`[IG][CAROUSEL] CONTAINER_CREATE_ATTEMPT_START | children=${Array.isArray(body.children) ? (body.children as string[]).join(",") : body.children} | media_type=${body.media_type} | caption_len=${typeof body.caption === "string" ? body.caption.length : 0} | encoding=${encoding}`);
+  }
 
   const isForm = encoding === "form";
   const response = await fetch(url, {
@@ -188,8 +192,10 @@ async function metaPost(
 
   const data = await response.json();
 
-  console.log(`${logPrefix}← ${response.status} ${response.statusText}`);
-  console.log(`${logPrefix}  response:`, JSON.stringify(data, null, 2).slice(0, 1000));
+  console.log(`[META][${context || "UNKNOWN"}] RESPONSE | status=${response.status} ${response.statusText} | +${Date.now() - tStart}ms | headers_content_type=${response.headers.get("content-type")} | body=${JSON.stringify(data).slice(0, 1500)}`);
+  if (context === "createCarouselContainer") {
+    console.log(`[IG][CAROUSEL] CONTAINER_CREATE_ATTEMPT_END | id=${data?.id} | full=${JSON.stringify(data)}`);
+  }
 
   if (data.error) {
     const { message, code, error_subcode, error_user_msg, error_user_title, is_transient } = data.error;
@@ -204,15 +210,7 @@ async function metaPost(
     err.isTransient = is_transient === true;
     // Códigos de token inválido/expirado da Meta: 190, 102, 463, 467
     err.isAuthError = [190, 102, 463, 467].includes(code);
-    console.error(`${logPrefix}❌ Meta error:`, {
-      message,
-      code,
-      error_subcode,
-      is_transient,
-      error_user_msg,
-      error_user_title,
-      httpStatus: response.status,
-    });
+    console.error(`[META][${context || "UNKNOWN"}] ERROR | message=${message} | code=${code} | subcode=${error_subcode} | is_transient=${is_transient} | error_user_msg=${error_user_msg} | error_user_title=${error_user_title} | httpStatus=${response.status} | fbtrace_id=${(data.error as any).fbtrace_id || ""} | full=${JSON.stringify(data)}`);
     throw err;
   }
 
@@ -233,25 +231,31 @@ async function waitForMediaReady(
   mediaId: string,
   creds: IgCredentials,
   maxAttempts: number = 12,
-  intervalMs: number = 3000
+  intervalMs: number = 3000,
+  label: string = ""
 ): Promise<void> {
+  const startedAt = Date.now();
+  const lbl = label ? `[${label}]` : "";
+  console.log(`[IG][WAIT] ${lbl} START | mediaId=${mediaId} | igUserId=${creds.igUserId} | maxAttempts=${maxAttempts} | intervalMs=${intervalMs}`);
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const elapsed = Date.now() - startedAt;
     const url = `${GRAPH_API_URL}/${mediaId}?fields=status_code,status&access_token=${encodeURIComponent(creds.accessToken)}`;
     const res = await fetch(url);
     const data = await res.json();
 
     if (data.error) {
+      console.error(`[IG][WAIT] ${lbl} API_ERROR | mediaId=${mediaId} | attempt=${attempt}/${maxAttempts} | +${elapsed}ms | error=${JSON.stringify(data.error)}`);
       throw new Error(`Meta (status): ${data.error.message} (code ${data.error.code})`);
     }
 
     const statusCode = data.status_code;
     const detail = typeof data.status === "string" ? data.status : "";
     console.log(
-      `⏳ [WAIT] Media ${mediaId} status: ${statusCode}${detail ? ` | ${detail}` : ""} (tentativa ${attempt}/${maxAttempts})`
+      `[IG][WAIT] ${lbl} POLL | mediaId=${mediaId} | attempt=${attempt}/${maxAttempts} | +${elapsed}ms | status_code=${statusCode} | status="${detail || "(empty)"}" | raw=${JSON.stringify(data).slice(0, 600)}`
     );
 
     if (statusCode === "FINISHED") {
-      console.log(`✅ [WAIT] Media ${mediaId} pronto`);
+      console.log(`[IG][WAIT] ${lbl} FINISHED | mediaId=${mediaId} | totalWait=${Date.now() - startedAt}ms | attempts=${attempt}`);
       return;
     }
 
@@ -260,11 +264,13 @@ async function waitForMediaReady(
       const motivo = detail
         ? `Motivo informado pela Meta: ${detail}`
         : "A Meta nao informou o motivo (campo `status` veio vazio).";
+      console.error(`[IG][WAIT] ${lbl} ERROR_FATAL | mediaId=${mediaId} | totalWait=${Date.now() - startedAt}ms | attempts=${attempt} | detail="${detail || "(empty)"}" | fullData=${JSON.stringify(data)}`);
       throw new Error(`Media ${mediaId} falhou no processamento. ${motivo}`);
     }
 
     // Container expirado: recriar é a única saida, a Meta não recycle.
     if (statusCode === "EXPIRED") {
+      console.error(`[IG][WAIT] ${lbl} EXPIRED | mediaId=${mediaId} | totalWait=${Date.now() - startedAt}ms | attempts=${attempt} | fullData=${JSON.stringify(data)}`);
       throw new Error(`Media ${mediaId} expirou antes de ficar pronto. E necessario recriar o container.`);
     }
 
@@ -273,6 +279,7 @@ async function waitForMediaReady(
     }
   }
 
+  console.error(`[IG][WAIT] ${lbl} TIMEOUT | mediaId=${mediaId} | totalWait=${Date.now() - startedAt}ms | maxAttempts=${maxAttempts}`);
   throw new Error(`Timeout aguardando media ${mediaId} ficar pronto (${maxAttempts * intervalMs / 1000}s)`);
 }
 
@@ -284,6 +291,7 @@ export const instagramService = {
    */
   async createCarouselItem(imageUrl: string, creds: IgCredentials): Promise<string> {
     const url = `${GRAPH_API_URL}/${creds.igUserId}/media`;
+    console.log(`[IG][ITEM] CREATE_START | igUserId=${creds.igUserId} | imageUrl=${imageUrl}`);
     const data = await metaPost(url, {
       image_url: imageUrl,
       is_carousel_item: true,
@@ -292,9 +300,11 @@ export const instagramService = {
 
     const itemId = typeof data?.id === "string" ? data.id.trim() : "";
     if (!itemId || !/^\d+$/.test(itemId)) {
+      console.error(`[IG][ITEM] CREATE_INVALID_ID | imageUrl=${imageUrl} | data=${JSON.stringify(data)}`);
       throw new Error(`A Meta nao devolveu um id valido para o item do carrossel (id="${itemId || "vazio"}").`);
     }
 
+    console.log(`[IG][ITEM] CREATE_END | itemId=${itemId} | imageUrl=${imageUrl}`);
     console.log(`📦 Item do carrossel criado: ${itemId}`);
     return itemId;
   },
@@ -308,21 +318,95 @@ export const instagramService = {
     creds: IgCredentials
   ): Promise<string> {
     const url = `${GRAPH_API_URL}/${creds.igUserId}/media`;
-    const data = await metaPost(url, {
-      media_type: "CAROUSEL",
-      children: childrenIds,
-      caption,
-      access_token: creds.accessToken,
-    }, "createCarouselContainer");
+    const tStart = Date.now();
 
-    const containerId = typeof data?.id === "string" ? data.id.trim() : "";
+    console.log(`[IG][CAROUSEL] CREATE_CONTAINER_START | igUserId=${creds.igUserId} | children=[${childrenIds.join(", ")}] | caption_len=${caption.length} | caption_preview=${caption.slice(0, 60).replace(/\n/g, "\\n")}`);
+
+    // TESTE TEMPORÁRIO: sanitizar legenda para isolar causa 2207032
+    let testCaption = caption;
+    try {
+      const cleaned = caption
+        .replace(/#[^\s#]+/g, "")
+        .replace(/@[^\s@]+/g, "")
+        .replace(/\r\n/g, "\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .replace(/[ \t]{2,}/g, " ")
+        .trim();
+      if (cleaned && cleaned !== caption) {
+        console.log(`[IG][CAROUSEL] CAPTION_CLEANED | before="${caption.slice(0, 80).replace(/\n/g, "\\n")}" | after="${cleaned.slice(0, 80).replace(/\n/g, "\\n")}" | len_before=${caption.length} | len_after=${cleaned.length}`);
+        testCaption = cleaned;
+      } else if (!cleaned) {
+        console.log(`[IG][CAROUSEL] CAPTION_CLEANED_EMPTY | keeping_original_preview="${caption.slice(0, 40).replace(/\n/g, "\\n")}"`);
+        testCaption = caption.slice(0, 100).trim() || caption;
+      }
+    } catch (e: any) {
+      console.warn(`[IG][CAROUSEL] CAPTION_CLEAN_FAILED | ${e.message}`);
+      testCaption = caption;
+    }
+
+    // Tentar com JSON primeiro (mais alinhado com documentação atual)
+    try {
+      const data = await metaPost(url, {
+        media_type: "CAROUSEL",
+        children: childrenIds,
+        caption: testCaption,
+        access_token: creds.accessToken,
+      }, "createCarouselContainer", "json");
+
+      let containerId = typeof data?.id === "string" ? data.id.trim() : "";
+      console.log(`[IG][CAROUSEL] JSON_ATTEMPT | response_id=${containerId} | full=${JSON.stringify(data)}`);
+
+      if (containerId && containerId !== "0" && /^\d+$/.test(containerId)) {
+        console.log(`[IG][CAROUSEL] CREATE_CONTAINER_END | containerId=${containerId} | totalMs=${Date.now() - tStart} | method=json`);
+        console.log(`🎠 Container do carrossel criado: ${containerId}`);
+        return containerId;
+      }
+
+      console.warn(`[IG][CAROUSEL] JSON_RETURNED_INVALID_ID | id=${containerId} | full=${JSON.stringify(data)}`);
+    } catch (e: any) {
+      console.warn(`[IG][CAROUSEL] JSON_ATTEMPT_FAILED | error=${e.message}`);
+    }
+
+    // Fallback para form-urlencoded com string separada por vírgula
+    const childrenStr = childrenIds.join(",");
+    console.log(`[IG][CAROUSEL] FALLBACK_FORM_START | childrenStr=${childrenStr}`);
+    let data = await metaPost(url, {
+      media_type: "CAROUSEL",
+      children: childrenStr,
+      caption: testCaption,
+      access_token: creds.accessToken,
+    }, "createCarouselContainer", "form");
+
+    let containerId = typeof data?.id === "string" ? data.id.trim() : "";
+    console.log(`[IG][CAROUSEL] FORM_ATTEMPT | response_id=${containerId} | full=${JSON.stringify(data)}`);
+
+    // Se vier id:"0", NÃO usar o retry com URLSearchParams (container nasce corrompido)
+    // Tentar novamente com form após pequeno delay
+    if (!containerId || containerId === "0") {
+      console.warn(`[IG][CAROUSEL] ID_ZERO_DETECTED | not_using_urlsearchparams_fallback | waiting_2000ms`);
+      await new Promise((r) => setTimeout(r, 2000));
+      
+      console.log(`[IG][CAROUSEL] RETRY_FORM_AFTER_DELAY | childrenStr=${childrenStr}`);
+      data = await metaPost(url, {
+        media_type: "CAROUSEL",
+        children: childrenStr,
+        caption: testCaption,
+        access_token: creds.accessToken,
+      }, "createCarouselContainer", "form");
+      
+      containerId = typeof data?.id === "string" ? data.id.trim() : "";
+      console.log(`[IG][CAROUSEL] RETRY_FORM_RESPONSE | response_id=${containerId} | full=${JSON.stringify(data)}`);
+    }
+
     if (!containerId || containerId === "0" || !/^\d+$/.test(containerId)) {
+      console.error(`[IG][CAROUSEL] CREATE_CONTAINER_INVALID | finalContainerId=${containerId || "empty"} | children=${childrenStr} | lastData=${JSON.stringify(data)}`);
       throw new Error(
         `A Meta nao devolveu um container de carrossel valido (id="${containerId || "vazio"}"). ` +
         `Sem isso nao da para publicar.`
       );
     }
 
+    console.log(`[IG][CAROUSEL] CREATE_CONTAINER_END | containerId=${containerId} | totalMs=${Date.now() - tStart}`);
     console.log(`🎠 Container do carrossel criado: ${containerId}`);
     return containerId;
   },
@@ -332,10 +416,12 @@ export const instagramService = {
    */
   async publishMedia(creationId: string, creds: IgCredentials): Promise<string> {
     const url = `${GRAPH_API_URL}/${creds.igUserId}/media_publish`;
+    console.log(`[IG][PUBLISH] PUBLISH_START | igUserId=${creds.igUserId} | creationId=${creationId}`);
     const data = await metaPost(url, {
       creation_id: creationId,
       access_token: creds.accessToken,
     }, "publishMedia");
+    console.log(`[IG][PUBLISH] PUBLISH_END | creationId=${creationId} | mediaId=${data.id}`);
     console.log(`🎉 Carrossel publicado no Instagram! Media ID: ${data.id}`);
     return data.id;
   },
@@ -383,21 +469,38 @@ export const instagramService = {
     caption: string,
     creds: IgCredentials
   ): Promise<{ mediaId: string; creationId: string }> {
+    const tFlow = Date.now();
+    console.log(`[IG][FLOW] POST_CAROUSEL_START | igUserId=${creds.igUserId} | cardUrl=${cardImageUrl} | baseUrl=${baseImageUrl} | caption_len=${caption.length}`);
     const cardItemId = await this.createCarouselItem(cardImageUrl, creds);
+    console.log(`[IG][FLOW] +${Date.now() - tFlow}ms AFTER_CREATE_CARD_ITEM | cardItemId=${cardItemId}`);
+    await waitForMediaReady(cardItemId, creds, 12, 3000, "CARD_ITEM");
+    console.log(`[IG][FLOW] +${Date.now() - tFlow}ms AFTER_WAIT_CARD_ITEM`);
 
+    console.log(`[IG][FLOW] INTERVAL_START | kind=between_items | +${Date.now() - tFlow}ms`);
     console.log("⏱️ Intervalo entre uploads pro Instagram...");
     await new Promise((resolve) => setTimeout(resolve, 1500));
+    console.log(`[IG][FLOW] INTERVAL_END | kind=between_items | +${Date.now() - tFlow}ms`);
 
     const baseItemId = await this.createCarouselItem(baseImageUrl, creds);
+    console.log(`[IG][FLOW] +${Date.now() - tFlow}ms AFTER_CREATE_BASE_ITEM | baseItemId=${baseItemId}`);
+    await waitForMediaReady(baseItemId, creds, 12, 3000, "BASE_ITEM");
+    console.log(`[IG][FLOW] +${Date.now() - tFlow}ms AFTER_WAIT_BASE_ITEM`);
+
+    console.log(`[IG][FLOW] INTERVAL_START | kind=before_container | +${Date.now() - tFlow}ms`);
+    console.log("⏱️ Aguardando 3s para os containers serem indexados na Meta...");
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    console.log(`[IG][FLOW] INTERVAL_END | kind=before_container | +${Date.now() - tFlow}ms`);
 
     const carouselId = await this.createCarouselContainer(
       [cardItemId, baseItemId],
       caption,
       creds
     );
+    console.log(`[IG][FLOW] +${Date.now() - tFlow}ms AFTER_CREATE_CAROUSEL_CONTAINER | carouselId=${carouselId}`);
 
     // O container pai tambem passa por processamento antes de poder ser publicado.
-    await waitForMediaReady(carouselId, creds);
+    await waitForMediaReady(carouselId, creds, 12, 3000, "CAROUSEL_CONTAINER");
+    console.log(`[IG][FLOW] +${Date.now() - tFlow}ms AFTER_WAIT_CAROUSEL_CONTAINER`);
 
     let mediaId: string;
     try {
@@ -407,6 +510,7 @@ export const instagramService = {
       e.childrenIds = [cardItemId, baseItemId];
       throw e;
     }
+    console.log(`[IG][FLOW] POST_CAROUSEL_END | totalMs=${Date.now() - tFlow} | mediaId=${mediaId} | creationId=${carouselId}`);
     return { mediaId, creationId: carouselId };
   },
 
@@ -420,17 +524,34 @@ export const instagramService = {
     caption: string,
     creds: IgCredentials
   ): Promise<{ mediaId: string; creationId: string }> {
+    const tFlow = Date.now();
+    console.log(`[IG][FLOW] POST_CAROUSEL_WITH_USER_START | igUserId=${creds.igUserId} | cardUrl=${cardImageUrl} | userUrl=${userImageUrl} | baseUrl=${baseImageUrl} | caption_len=${caption.length} | userSlidePos=${USER_IMAGE_SLIDE_POSITION}`);
     const cardItemId = await this.createCarouselItem(cardImageUrl, creds);
+    console.log(`[IG][FLOW] +${Date.now() - tFlow}ms AFTER_CREATE_CARD_ITEM | cardItemId=${cardItemId}`);
+    await waitForMediaReady(cardItemId, creds, 12, 3000, "CARD_ITEM");
 
+    console.log(`[IG][FLOW] INTERVAL_START | kind=between_items1 | +${Date.now() - tFlow}ms`);
     console.log("⏱️ Intervalo entre uploads pro Instagram (1)...");
     await new Promise((resolve) => setTimeout(resolve, 1500));
+    console.log(`[IG][FLOW] INTERVAL_END | kind=between_items1 | +${Date.now() - tFlow}ms`);
 
     const userImageItemId = await this.createCarouselItem(userImageUrl, creds);
+    console.log(`[IG][FLOW] +${Date.now() - tFlow}ms AFTER_CREATE_USER_ITEM | userImageItemId=${userImageItemId}`);
+    await waitForMediaReady(userImageItemId, creds, 12, 3000, "USER_ITEM");
 
+    console.log(`[IG][FLOW] INTERVAL_START | kind=between_items2 | +${Date.now() - tFlow}ms`);
     console.log("⏱️ Intervalo entre uploads pro Instagram (2)...");
     await new Promise((resolve) => setTimeout(resolve, 1500));
+    console.log(`[IG][FLOW] INTERVAL_END | kind=between_items2 | +${Date.now() - tFlow}ms`);
 
     const baseItemId = await this.createCarouselItem(baseImageUrl, creds);
+    console.log(`[IG][FLOW] +${Date.now() - tFlow}ms AFTER_CREATE_BASE_ITEM | baseItemId=${baseItemId}`);
+    await waitForMediaReady(baseItemId, creds, 12, 3000, "BASE_ITEM");
+
+    console.log(`[IG][FLOW] INTERVAL_START | kind=before_container | +${Date.now() - tFlow}ms`);
+    console.log("⏱️ Aguardando 1.5s para os containers serem indexados na Meta...");
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    console.log(`[IG][FLOW] INTERVAL_END | kind=before_container | +${Date.now() - tFlow}ms`);
 
     const children =
       USER_IMAGE_SLIDE_POSITION === 1
@@ -438,9 +559,11 @@ export const instagramService = {
         : [cardItemId, userImageItemId, baseItemId];
 
     const carouselId = await this.createCarouselContainer(children, caption, creds);
+    console.log(`[IG][FLOW] +${Date.now() - tFlow}ms AFTER_CREATE_CAROUSEL_CONTAINER | carouselId=${carouselId} | children=${children.join(",")}`);
 
     // O container pai tambem passa por processamento antes de poder ser publicado.
-    await waitForMediaReady(carouselId, creds);
+    await waitForMediaReady(carouselId, creds, 12, 3000, "CAROUSEL_CONTAINER");
+    console.log(`[IG][FLOW] +${Date.now() - tFlow}ms AFTER_WAIT_CAROUSEL_CONTAINER`);
 
     let mediaId: string;
     try {
@@ -450,6 +573,7 @@ export const instagramService = {
       e.childrenIds = children;
       throw e;
     }
+    console.log(`[IG][FLOW] POST_CAROUSEL_WITH_USER_END | totalMs=${Date.now() - tFlow} | mediaId=${mediaId} | creationId=${carouselId}`);
     return { mediaId, creationId: carouselId };
   },
 
