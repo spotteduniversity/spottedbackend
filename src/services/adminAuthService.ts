@@ -9,13 +9,19 @@
  * Variáveis de ambiente:
  *   ADMIN_JWT_SECRET — segredo para assinar JWTs de admin (diferente de JWT_SECRET)
  *   Gere com: node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"
+ *   ADMIN_JWT_EXPIRES_IN — validade do JWT de admin (padrão: 365d)
  */
 
 import bcrypt from "bcrypt";
-import jwt from "jsonwebtoken";
+import jwt, { type SignOptions } from "jsonwebtoken";
 
 const SALT_ROUNDS = 12;
-const ADMIN_JWT_EXPIRES_IN = "8h";
+const DEFAULT_ADMIN_JWT_EXPIRES_IN = "365d";
+
+function getAdminJwtExpiresIn(): SignOptions["expiresIn"] {
+  return (process.env.ADMIN_JWT_EXPIRES_IN?.trim() ||
+    DEFAULT_ADMIN_JWT_EXPIRES_IN) as SignOptions["expiresIn"];
+}
 
 function getAdminJwtSecret(): string {
   const secret = process.env.ADMIN_JWT_SECRET;
@@ -55,10 +61,10 @@ export async function verifyAdminPassword(plain: string, hash: string): Promise<
 }
 
 /**
- * Assina um JWT de admin com expiração de 8h.
+ * Assina um JWT de admin com expiração de 1 ano (ou ADMIN_JWT_EXPIRES_IN).
  */
 export function signAdminToken(payload: AdminJwtPayload): string {
-  return jwt.sign(payload, getAdminJwtSecret(), { expiresIn: ADMIN_JWT_EXPIRES_IN });
+  return jwt.sign(payload, getAdminJwtSecret(), { expiresIn: getAdminJwtExpiresIn() });
 }
 
 /**

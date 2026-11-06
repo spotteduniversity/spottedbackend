@@ -2,7 +2,7 @@
  * adminAuthController.ts
  *
  * Endpoints de autenticação de admins:
- *   POST /api/admin/auth/login  — Login com username + senha, retorna JWT (8h)
+ *   POST /api/admin/auth/login  — Login com username + senha, retorna JWT (1 ano)
  *   GET  /api/admin/auth/me     — Retorna dados do admin logado + contas vinculadas
  */
 
