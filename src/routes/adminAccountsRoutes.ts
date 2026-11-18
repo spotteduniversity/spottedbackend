@@ -24,6 +24,9 @@ const router = Router();
 // (ex.: is_moderated). O token continua sendo removido por publicAccount().
 const SELECT_ACCOUNT_SECRET = "*";
 
+/** Limite do Instagram para a legenda completa (conteúdo + base_caption). */
+const MAX_BASE_CAPTION_LENGTH = 2200;
+
 /** Tira o segredo e expõe somente a existência de um token configurado. */
 function publicAccount(row: Record<string, any>) {
   const { access_token_encrypted, ...rest } = row;
@@ -98,12 +101,22 @@ router.post("/", requireAdmin, async (req: Request, res: Response) => {
   try {
     if (!supabase) throw new Error("Supabase não configurado.");
 
-    const { display_name, username, is_moderated } = req.body;
+    const { display_name, username, base_caption, is_moderated } = req.body;
     if (!display_name?.trim()) {
       return fail(res, 400, "Informe o nome da cidade.");
     }
     if (is_moderated !== undefined && typeof is_moderated !== "boolean") {
       return fail(res, 400, "is_moderated deve ser booleano.");
+    }
+    if (typeof base_caption !== "string" || !base_caption.trim()) {
+      return fail(res, 400, "Informe a legenda base da conta.");
+    }
+    if (base_caption.trim().length > MAX_BASE_CAPTION_LENGTH) {
+      return fail(
+        res,
+        400,
+        `A legenda base deve ter no máximo ${MAX_BASE_CAPTION_LENGTH} caracteres.`
+      );
     }
 
     const now = new Date().toISOString();
@@ -123,6 +136,7 @@ router.post("/", requireAdmin, async (req: Request, res: Response) => {
         is_active: true,
         text_color: "#ffffff",
         shadow_color: "rgba(0, 0, 0, 0.65)",
+        base_caption: base_caption.trim(),
         ...(typeof is_moderated === "boolean" ? { is_moderated } : {}),
         created_at: now,
         updated_at: now,
@@ -150,6 +164,7 @@ router.patch("/:id", requireAdmin, requireAccountAccess, async (req: Request, re
       "slug",
       "text_color",
       "shadow_color",
+      "base_caption",
       "is_moderated",
     ] as const;
     const patch: Record<string, unknown> = {};
@@ -162,6 +177,20 @@ router.patch("/:id", requireAdmin, requireAccountAccess, async (req: Request, re
     }
     if (patch.is_moderated !== undefined && typeof patch.is_moderated !== "boolean") {
       return fail(res, 400, "is_moderated deve ser booleano.");
+    }
+    if (patch.base_caption !== undefined) {
+      if (typeof patch.base_caption !== "string" || !patch.base_caption.trim()) {
+        return fail(res, 400, "Informe a legenda base da conta.");
+      }
+      const baseCaption = patch.base_caption.trim();
+      if (baseCaption.length > MAX_BASE_CAPTION_LENGTH) {
+        return fail(
+          res,
+          400,
+          `A legenda base deve ter no máximo ${MAX_BASE_CAPTION_LENGTH} caracteres.`
+        );
+      }
+      patch.base_caption = baseCaption;
     }
     if (patch.username !== undefined) {
       // Regras de usuário do Instagram: até 30 chars, sem @, espaço ou hífen.
