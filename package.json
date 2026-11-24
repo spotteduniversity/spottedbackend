@@ -5,7 +5,8 @@
   "main": "app.js",
   "scripts": {
     "dev": "ts-node src/index.ts",
-    "start": "ts-node src/index.ts"
+    "start": "ts-node src/index.ts",
+    "backfill:locations": "ts-node src/scripts/backfillLocations.ts"
   },
   "keywords": [],
   "author": "",

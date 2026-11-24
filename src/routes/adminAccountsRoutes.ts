@@ -17,6 +17,10 @@ import { supabase } from "../config/supabase";
 import { cityAssetsService, assetUpload } from "../services/cityAssetsService";
 import { encrypt } from "../services/cryptoService";
 import { verifyInstagramCredentials } from "../services/instagramService";
+import {
+  LocationValidationError,
+  resolveLocationFields,
+} from "../services/accountLocationService";
 
 const router = Router();
 
@@ -94,6 +98,33 @@ router.get("/", requireAdmin, async (req: Request, res: Response) => {
   }
 });
 
+// GET /api/admin/accounts/map
+// Lê a view public.spotted_map_accounts via service role, respeitando o escopo do admin.
+router.get("/map", requireAdmin, async (req: Request, res: Response) => {
+  try {
+    if (!supabase) throw new Error("Supabase não configurado.");
+
+    const admin = req.admin!;
+    let query = supabase
+      .from("spotted_map_accounts")
+      .select("*")
+      .order("display_name", { ascending: true });
+
+    if (!admin.is_super) {
+      const ids = await adminRepository.getAccountIds(admin.adminId, false);
+      if (ids.length === 0) return res.json({ success: true, accounts: [] });
+      query = query.in("id", ids);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    res.json({ success: true, accounts: data ?? [] });
+  } catch (error: any) {
+    fail(res, 500, error.message);
+  }
+});
+
 // POST /api/admin/accounts
 // Cria a cidade. A conta nasce sem credencial: o admin cola o token e o IG
 // User ID depois, em PUT /:id/credentials.
@@ -101,7 +132,9 @@ router.post("/", requireAdmin, async (req: Request, res: Response) => {
   try {
     if (!supabase) throw new Error("Supabase não configurado.");
 
-    const { display_name, username, base_caption, is_moderated } = req.body;
+    // `lat`, `lng` e `ibge_city_code` enviados pelo cliente são ignorados de propósito.
+    const { display_name, username, base_caption, is_moderated, city, state } =
+      req.body;
     if (!display_name?.trim()) {
       return fail(res, 400, "Informe o nome da cidade.");
     }
@@ -117,6 +150,16 @@ router.post("/", requireAdmin, async (req: Request, res: Response) => {
         400,
         `A legenda base deve ter no máximo ${MAX_BASE_CAPTION_LENGTH} caracteres.`
       );
+    }
+
+    let locationFields;
+    try {
+      locationFields = await resolveLocationFields(city, state);
+    } catch (error: unknown) {
+      if (error instanceof LocationValidationError) {
+        return fail(res, error.status, error.message);
+      }
+      throw error;
     }
 
     const now = new Date().toISOString();
@@ -138,6 +181,7 @@ router.post("/", requireAdmin, async (req: Request, res: Response) => {
         shadow_color: "rgba(0, 0, 0, 0.65)",
         base_caption: base_caption.trim(),
         ...(typeof is_moderated === "boolean" ? { is_moderated } : {}),
+        ...locationFields,
         created_at: now,
         updated_at: now,
       })
@@ -170,6 +214,37 @@ router.patch("/:id", requireAdmin, requireAccountAccess, async (req: Request, re
     const patch: Record<string, unknown> = {};
     for (const field of allowed) {
       if (req.body[field] !== undefined) patch[field] = req.body[field];
+    }
+
+    // Qualquer alteração em city/state recalcula os 5 campos no servidor e
+    // ignora lat, lng ou ibge_city_code enviados pelo cliente.
+    const hasCityInBody = req.body.city !== undefined;
+    const hasStateInBody = req.body.state !== undefined;
+    if (hasCityInBody || hasStateInBody) {
+      let nextCity = req.body.city;
+      let nextState = req.body.state;
+
+      if (!hasCityInBody || !hasStateInBody) {
+        const { data: currentAccount, error: lookupError } = await supabase
+          .from("instagram_accounts")
+          .select("city, state")
+          .eq("id", id)
+          .single();
+
+        if (lookupError) throw new Error(lookupError.message);
+        if (!hasCityInBody) nextCity = currentAccount?.city ?? null;
+        if (!hasStateInBody) nextState = currentAccount?.state ?? null;
+      }
+
+      try {
+        const locationFields = await resolveLocationFields(nextCity, nextState);
+        Object.assign(patch, locationFields);
+      } catch (error: unknown) {
+        if (error instanceof LocationValidationError) {
+          return fail(res, error.status, error.message);
+        }
+        throw error;
+      }
     }
 
     if (patch.display_name !== undefined && !String(patch.display_name).trim()) {
